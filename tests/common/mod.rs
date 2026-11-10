@@ -29,11 +29,22 @@ pub struct TestServer {
     pub url_prefix: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     pub handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl TestServer {
     pub async fn spawn(config: Config, dir: tempfile::TempDir) -> Self {
+        Self::spawn_at(config, Some(dir)).await
+    }
+
+    /// Spawn with an externally managed data dir (`config.data_dir`). The
+    /// caller owns the directory lifetime — used for restart tests where the
+    /// store must outlive a server shutdown.
+    pub async fn spawn_with_data_dir(config: Config) -> Self {
+        Self::spawn_at(config, None).await
+    }
+
+    async fn spawn_at(config: Config, dir: Option<tempfile::TempDir>) -> Self {
         let base_url = format!("http://{}", config.addr);
         let url_prefix = bark_server_rs::api::normalized_prefix(&config.url_prefix);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
