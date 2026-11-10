@@ -9,10 +9,15 @@
 //! exactly like fiber, which matches consts against the lowercased detection
 //! path but slices params from the original path.
 //!
+//! Basic Auth (see [`auth`]) also runs in [`AppService`], in front of every
+//! route including the fallbacks, exactly like upstream's fiber middleware —
+//! so later MCP/SSE routes inherit it automatically.
+//!
 //! The normalization runs in [`AppService`], which wraps the whole `Router`:
 //! `Router::layer` middleware would run *after* routing (see axum's
 //! "Rewriting request URI in middleware" docs) and be too late.
 
+mod auth;
 pub mod misc;
 pub mod register;
 
@@ -198,9 +203,10 @@ fn detection_path_for(path: &str, case_sensitive: bool, strict_routing: bool) ->
     out
 }
 
-/// The application service: the route [`Router`] wrapped with fiber-compatible
-/// request normalization (before routing) and the `Server: Bark` response
-/// header (on every response, like fiber's `ServerHeader` config).
+/// The application service: the route [`Router`] wrapped with Basic Auth
+/// (before everything), fiber-compatible request normalization (before
+/// routing) and the `Server: Bark` response header (on every response, like
+/// fiber's `ServerHeader` config).
 ///
 /// Generic over the request body type so it can be served both by
 /// `axum::serve` (axum `Body`) and `axum_server` (hyper `Incoming`).
@@ -209,14 +215,21 @@ pub struct AppService<S> {
     inner: S,
     case_sensitive: bool,
     strict_routing: bool,
+    auth: Option<auth::BasicAuth>,
 }
 
 impl<S> AppService<S> {
-    pub fn new(inner: S, case_sensitive: bool, strict_routing: bool) -> Self {
+    pub fn new(
+        inner: S,
+        case_sensitive: bool,
+        strict_routing: bool,
+        auth: Option<auth::BasicAuth>,
+    ) -> Self {
         Self {
             inner,
             case_sensitive,
             strict_routing,
+            auth,
         }
     }
 }
@@ -243,6 +256,21 @@ where
         req.extensions_mut().insert(OriginalPath(path.clone()));
 
         let detection_path = detection_path_for(&path, self.case_sensitive, self.strict_routing);
+
+        // Basic Auth sits in front of everything (before routing and before
+        // case/trailing-slash normalization), mirroring upstream's fiber
+        // middleware: coverage is decided on the detection path, exemptions
+        // on the raw path, and failures answer 418 without reaching any route.
+        if let Some(auth) = &self.auth
+            && auth.covers(&detection_path)
+            && !auth.is_exempt(&path)
+            && !auth.authorized(req.headers())
+        {
+            return AppServiceFuture::Teapot {
+                inner: std::future::ready(Ok(auth::teapot_response())),
+            };
+        }
+
         if detection_path != path {
             let path_and_query = match req.uri().query() {
                 Some(q) => format!("{detection_path}?{q}"),
@@ -252,16 +280,24 @@ where
                 *req.uri_mut() = uri;
             }
         }
-        AppServiceFuture {
+        AppServiceFuture::Inner {
             inner: self.inner.call(req),
         }
     }
 }
 
 pin_project! {
-    pub struct AppServiceFuture<F> {
-        #[pin]
-        inner: F,
+    #[project = AppServiceFutureProj]
+    pub enum AppServiceFuture<F> {
+        Inner {
+            #[pin]
+            inner: F,
+        },
+        /// Immediate 418 teapot from the Basic Auth middleware.
+        Teapot {
+            #[pin]
+            inner: std::future::Ready<Result<Response, std::convert::Infallible>>,
+        },
     }
 }
 
@@ -273,7 +309,10 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let mut res = std::task::ready!(this.inner.poll(cx))?;
+        let mut res = match this {
+            AppServiceFutureProj::Inner { inner } => std::task::ready!(inner.poll(cx))?,
+            AppServiceFutureProj::Teapot { inner } => std::task::ready!(inner.poll(cx))?,
+        };
         res.headers_mut()
             .insert(header::SERVER, HeaderValue::from_static("Bark"));
         Poll::Ready(Ok(res))
@@ -313,5 +352,10 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
         app,
         state.config.case_sensitive,
         state.config.strict_routing,
+        auth::BasicAuth::from_config(
+            &state.config.url_prefix,
+            &state.config.basic_auth_user,
+            &state.config.basic_auth_password,
+        ),
     )
 }
