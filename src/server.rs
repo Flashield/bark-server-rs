@@ -9,6 +9,7 @@ use axum::Router;
 use axum::ServiceExt;
 
 use crate::api;
+use crate::apns::ApnsClient;
 use crate::config::Config;
 use crate::store::{SqliteStore, Store};
 
@@ -16,6 +17,8 @@ use crate::store::{SqliteStore, Store};
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
+    /// APNs delivery client (endpoint from `--apns-endpoint`).
+    pub apns: Arc<ApnsClient>,
 }
 
 /// Future resolving on SIGINT or SIGTERM (upstream's graceful shutdown
@@ -50,12 +53,16 @@ pub async fn run_server(
     config: Config,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    // Upstream: initializeDatabase before startServer.
+    // Upstream: initializeDatabase before startServer (ReCreateAPNS runs in
+    // upstream's init(); the client is built here from the config instead,
+    // which is equivalent since no connection is made until a push).
     let store = SqliteStore::open(&config.data_dir)
         .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?;
+    let apns = ApnsClient::from_config(&config).context("failed to initialize APNs client")?;
     let state = AppState {
         config: Arc::new(config.clone()),
         store: Arc::new(store),
+        apns: Arc::new(apns),
     };
     let app_service = api::build_app_service(&state);
     let db_label = format!("sqlite({})", config.data_dir.display());

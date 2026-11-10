@@ -19,6 +19,7 @@
 
 mod auth;
 pub mod misc;
+pub mod push;
 pub mod realtime;
 pub mod register;
 
@@ -155,6 +156,16 @@ where
         .fallback(method_not_allowed)
 }
 
+/// `post(...)` with a fiber-compatible 405 fallback for other methods
+/// (upstream registers only POST on `/push`).
+fn post_route<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    post(handler).fallback(method_not_allowed)
+}
+
 /// `delete(...)` with a fiber-compatible 405 fallback for other methods.
 fn delete_route<H, T>(handler: H) -> MethodRouter<AppState>
 where
@@ -180,7 +191,7 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
 /// its original case. Device Keys are 22 chars and can never collide with a
 /// static name, so this is exact for all reachable requests.
 const STATIC_SEGMENTS: &[&str] = &[
-    "ping", "healthz", "info", "register",
+    "ping", "healthz", "info", "register", "push",
     // Realtime credential plane (api/realtime.rs); like the upstream route
     // names, these match case-insensitively under fiber's default config.
     "realtime", "v1", "devices", "streams",
@@ -350,6 +361,7 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             "/register/{device_key}",
             get_route(register::register_check),
         )
+        .route("/push", post_route(push::push_post))
         // Realtime credential plane: mint (POST) + list (GET) a Device's
         // Stream Tokens, revoke one by id (DELETE). api/realtime.rs holds
         // the contract.

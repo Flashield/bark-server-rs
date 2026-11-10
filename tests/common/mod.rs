@@ -6,6 +6,8 @@
 
 #![allow(dead_code)] // helpers are shared per test-target, not all used everywhere
 
+pub mod apns_stub;
+
 use std::time::Duration;
 
 use bark_server_rs::config::Config;

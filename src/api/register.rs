@@ -354,8 +354,9 @@ fn bind_pairs(pairs: &[(String, String)]) -> DeviceInfo {
     info
 }
 
-/// Decode an `application/x-www-form-urlencoded` string into pairs.
-fn decode_form_pairs(input: &str) -> Vec<(String, String)> {
+/// Decode an `application/x-www-form-urlencoded` string into pairs (shared
+/// with the push route's query-arg override).
+pub(crate) fn decode_form_pairs(input: &str) -> Vec<(String, String)> {
     input
         .split('&')
         .map(|pair| match pair.split_once('=') {
