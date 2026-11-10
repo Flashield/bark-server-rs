@@ -18,6 +18,11 @@
 //! posts JSON; scripts use query or form). This implementation answers
 //! multipart with fiber's "request bind failed2: Unprocessable Entity"
 //! instead of binding it.
+//!
+//! A second, additive deviation (ADR-0006): the `stream` device type is
+//! accepted and registers **without** a Device Token — upstream rejects any
+//! unknown type and always requires a token. See [`do_register`] for the
+//! exact semantics; `ios`/`watchos` behavior is byte-identical to upstream.
 
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
@@ -27,7 +32,7 @@ use serde_json::{Value, json};
 
 use crate::api::{CommonResp, envelope_response, error_envelope};
 use crate::server::AppState;
-use crate::store::{DEVICE_TYPE_IOS, DEVICE_TYPE_WATCHOS};
+use crate::store::{DEVICE_TYPE_IOS, DEVICE_TYPE_STREAM, DEVICE_TYPE_WATCHOS};
 
 /// Upstream `DeviceInfo` (route_register.go): canonical fields plus the
 /// `key`/`devicetoken` aliases for old requests.
@@ -150,21 +155,35 @@ pub async fn register_check(
 
 /// Shared registration flow (upstream `doRegister`): alias resolution,
 /// validation, save, and the response carrying both key spellings.
+///
+/// One deliberate deviation (ADR-0006 additive extension): the `stream`
+/// device type registers **without** a Device Token — Stream Devices have
+/// none (GLOSSARY.md) — and any Device Token provided alongside
+/// `device_type=stream` is ignored and stored empty. `ios`/`watchos` keep
+/// upstream's token-required validation byte-identical, and the upstream
+/// check order (token checks before the type check) is preserved for them.
 async fn do_register(state: AppState, mut info: DeviceInfo) -> Response {
     if info.device_key.is_empty() && !info.old_device_key.is_empty() {
         info.device_key = std::mem::take(&mut info.old_device_key);
     }
 
-    if info.device_token.is_empty() {
-        if info.old_device_token.is_empty() {
-            return error_envelope(StatusCode::BAD_REQUEST, "device token is empty");
-        }
-        info.device_token = std::mem::take(&mut info.old_device_token);
-    }
+    // Peek at the (case-insensitive) type without failing yet: a `stream`
+    // registration skips the token checks below entirely, while every other
+    // type keeps upstream's exact validation and error precedence.
+    let is_stream = info.device_type.to_lowercase() == DEVICE_TYPE_STREAM;
 
-    // DeviceToken length is variable, but should not be too long.
-    if info.device_token.len() > 160 {
-        return error_envelope(StatusCode::BAD_REQUEST, "device token is invalid");
+    if !is_stream {
+        if info.device_token.is_empty() {
+            if info.old_device_token.is_empty() {
+                return error_envelope(StatusCode::BAD_REQUEST, "device token is empty");
+            }
+            info.device_token = std::mem::take(&mut info.old_device_token);
+        }
+
+        // DeviceToken length is variable, but should not be too long.
+        if info.device_token.len() > 160 {
+            return error_envelope(StatusCode::BAD_REQUEST, "device token is invalid");
+        }
     }
 
     // The device type selects the APNs topic when pushing; default to ios
@@ -179,6 +198,12 @@ async fn do_register(state: AppState, mut info: DeviceInfo) -> Response {
             );
         }
     };
+
+    // Enforce the Stream Device invariant at the boundary: no Device Token,
+    // whatever the request carried.
+    if device_type == DEVICE_TYPE_STREAM {
+        info.device_token.clear();
+    }
 
     // An empty or unknown key is a new registration: the store mints a new
     // Device Key (upstream bbolt semantics).
@@ -210,13 +235,15 @@ async fn do_register(state: AppState, mut info: DeviceInfo) -> Response {
 }
 
 /// Lowercase the device type, defaulting to `ios` when empty; anything
-/// besides the two supported types is rejected.
+/// besides the supported types is rejected. `stream` is the token-less
+/// device type added by ADR-0006 (upstream accepts only the first two).
 fn normalized_device_type(device_type: &str) -> Result<&'static str, ()> {
     let lowered = device_type.to_lowercase();
     match lowered.as_str() {
         "" => Ok(DEVICE_TYPE_IOS),
         DEVICE_TYPE_IOS => Ok(DEVICE_TYPE_IOS),
         DEVICE_TYPE_WATCHOS => Ok(DEVICE_TYPE_WATCHOS),
+        DEVICE_TYPE_STREAM => Ok(DEVICE_TYPE_STREAM),
         _ => Err(()),
     }
 }
