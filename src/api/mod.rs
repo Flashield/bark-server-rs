@@ -19,6 +19,7 @@
 
 mod auth;
 pub mod misc;
+pub mod push;
 pub mod register;
 
 use std::future::Future;
@@ -154,6 +155,16 @@ where
         .fallback(method_not_allowed)
 }
 
+/// `post(...)` with a fiber-compatible 405 fallback for other methods
+/// (upstream registers only POST on `/push`).
+fn post_route<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    post(handler).fallback(method_not_allowed)
+}
+
 pub fn normalized_prefix(url_prefix: &str) -> String {
     let trimmed = url_prefix.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -169,7 +180,7 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
 /// segment — path parameters like Device Keys, or unmatched paths — keeps
 /// its original case. Device Keys are 22 chars and can never collide with a
 /// static name, so this is exact for all reachable requests.
-const STATIC_SEGMENTS: &[&str] = &["ping", "healthz", "info", "register"];
+const STATIC_SEGMENTS: &[&str] = &["ping", "healthz", "info", "register", "push"];
 
 /// Fiber-compatible path normalization: trim all trailing slashes unless
 /// `--strict-routing` (fiber: `utils.TrimRightBytes(detectionPath, '/')`),
@@ -335,6 +346,7 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             "/register/{device_key}",
             get_route(register::register_check),
         )
+        .route("/push", post_route(push::push_post))
         .fallback(not_found)
         .with_state(state.clone());
 

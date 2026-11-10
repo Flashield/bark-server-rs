@@ -114,6 +114,10 @@ pub struct Config {
     /// `--apns-endpoint` / `BARK_SERVER_APNS_ENDPOINT` (additive; the test
     /// stub injection point for APNs delivery, see spec/ADR-0004)
     pub apns_endpoint: String,
+    /// `--apns-insecure-skip-tls-verify` /
+    /// `BARK_SERVER_APNS_INSECURE_SKIP_TLS_VERIFY` (additive; companion to
+    /// `--apns-endpoint` so a local self-signed APNs stub can stand in)
+    pub apns_insecure_skip_tls_verify: bool,
 }
 
 impl Default for Config {
@@ -138,6 +142,7 @@ impl Default for Config {
             write_timeout: Duration::from_secs(3),
             idle_timeout: Duration::from_secs(10),
             apns_endpoint: "https://api.push.apple.com".into(),
+            apns_insecure_skip_tls_verify: false,
         }
     }
 }
@@ -267,6 +272,17 @@ pub struct Cli {
         default_value = "https://api.push.apple.com"
     )]
     pub apns_endpoint: String,
+
+    /// Skip TLS certificate verification for the APNs endpoint (additive;
+    /// companion to `--apns-endpoint` so a local self-signed stub can stand in)
+    #[arg(
+        long,
+        env = "BARK_SERVER_APNS_INSECURE_SKIP_TLS_VERIFY",
+        default_value = "false",
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    pub apns_insecure_skip_tls_verify: bool,
 }
 
 /// Every long flag name the CLI defines (plus the auto-generated ones), used
@@ -291,6 +307,7 @@ const LONG_FLAGS: &[&str] = &[
     "write-timeout",
     "idle-timeout",
     "apns-endpoint",
+    "apns-insecure-skip-tls-verify",
     "help",
     "version",
 ];
@@ -353,6 +370,7 @@ impl Cli {
             write_timeout: self.write_timeout.0,
             idle_timeout: self.idle_timeout.0,
             apns_endpoint: self.apns_endpoint.clone(),
+            apns_insecure_skip_tls_verify: self.apns_insecure_skip_tls_verify,
         }
     }
 }
