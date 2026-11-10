@@ -19,6 +19,7 @@
 
 mod auth;
 pub mod misc;
+pub mod realtime;
 pub mod register;
 
 use std::future::Future;
@@ -28,7 +29,7 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{MethodRouter, get, post};
+use axum::routing::{MethodRouter, delete, get, post};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 
@@ -154,6 +155,15 @@ where
         .fallback(method_not_allowed)
 }
 
+/// `delete(...)` with a fiber-compatible 405 fallback for other methods.
+fn delete_route<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    delete(handler).fallback(method_not_allowed)
+}
+
 pub fn normalized_prefix(url_prefix: &str) -> String {
     let trimmed = url_prefix.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -169,7 +179,12 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
 /// segment — path parameters like Device Keys, or unmatched paths — keeps
 /// its original case. Device Keys are 22 chars and can never collide with a
 /// static name, so this is exact for all reachable requests.
-const STATIC_SEGMENTS: &[&str] = &["ping", "healthz", "info", "register"];
+const STATIC_SEGMENTS: &[&str] = &[
+    "ping", "healthz", "info", "register",
+    // Realtime credential plane (api/realtime.rs); like the upstream route
+    // names, these match case-insensitively under fiber's default config.
+    "realtime", "v1", "devices", "streams",
+];
 
 /// Fiber-compatible path normalization: trim all trailing slashes unless
 /// `--strict-routing` (fiber: `utils.TrimRightBytes(detectionPath, '/')`),
@@ -334,6 +349,17 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
         .route(
             "/register/{device_key}",
             get_route(register::register_check),
+        )
+        // Realtime credential plane: mint (POST) + list (GET) a Device's
+        // Stream Tokens, revoke one by id (DELETE). api/realtime.rs holds
+        // the contract.
+        .route(
+            "/realtime/v1/devices/{device_key}/streams",
+            post_get_route(realtime::streams_create, realtime::streams_list),
+        )
+        .route(
+            "/realtime/v1/devices/{device_key}/streams/{token_id}",
+            delete_route(realtime::stream_revoke),
         )
         .fallback(not_found)
         .with_state(state.clone());

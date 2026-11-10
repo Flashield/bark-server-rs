@@ -39,14 +39,8 @@ pub fn encode(uuid: [u8; 16]) -> String {
 /// what the `uuid` crate would produce for `Uuid::new_v4()`.
 fn new_uuid_v4() -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    read_csprng(&mut bytes);
+    crate::random::fill(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     bytes
-}
-
-fn read_csprng(buf: &mut [u8]) {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
-    f.read_exact(buf).expect("read full entropy buffer");
 }
