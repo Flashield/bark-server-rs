@@ -6,6 +6,7 @@
 pub mod api;
 pub mod config;
 pub mod server;
+pub mod shortuuid;
 pub mod store;
 
 pub use config::Config;

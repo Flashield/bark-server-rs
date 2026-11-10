@@ -4,6 +4,10 @@
 //! Route matching mirrors upstream fiber v2 semantics (verified against the
 //! live Go server): case-insensitive and trailing-slash-tolerant by default,
 //! with `--case-sensitive` / `--strict-routing` restoring strict behavior.
+//! Case-insensitivity applies to the static route segments only — path
+//! parameters (Device Keys) reach handlers with their original casing,
+//! exactly like fiber, which matches consts against the lowercased detection
+//! path but slices params from the original path.
 //!
 //! Basic Auth (see [`auth`]) also runs in [`AppService`], in front of every
 //! route including the fallbacks, exactly like upstream's fiber middleware —
@@ -15,6 +19,7 @@
 
 mod auth;
 pub mod misc;
+pub mod register;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +28,7 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{MethodRouter, get};
+use axum::routing::{MethodRouter, get, post};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 
@@ -135,6 +140,20 @@ where
     get(handler).fallback(method_not_allowed)
 }
 
+/// `post(...)` + `get(...)` on one path (upstream registers both on
+/// `/register`), with a fiber-compatible 405 fallback for other methods.
+fn post_get_route<H1, T1, H2, T2>(post_handler: H1, get_handler: H2) -> MethodRouter<AppState>
+where
+    H1: axum::handler::Handler<T1, AppState>,
+    H2: axum::handler::Handler<T2, AppState>,
+    T1: 'static,
+    T2: 'static,
+{
+    post(post_handler)
+        .get(get_handler)
+        .fallback(method_not_allowed)
+}
+
 pub fn normalized_prefix(url_prefix: &str) -> String {
     let trimmed = url_prefix.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -144,20 +163,44 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
     }
 }
 
-/// Fiber-compatible path normalization: lowercase the path unless
-/// `--case-sensitive`, and trim all trailing slashes unless `--strict-routing`
-/// (fiber: `utils.TrimRightBytes(detectionPath, '/')`).
+/// The static (non-parametric) path segments of all routes. Under fiber's
+/// default case-insensitive matching, segments equal to one of these
+/// (ignoring ASCII case) canonicalize to their lowercase form; every other
+/// segment — path parameters like Device Keys, or unmatched paths — keeps
+/// its original case. Device Keys are 22 chars and can never collide with a
+/// static name, so this is exact for all reachable requests.
+const STATIC_SEGMENTS: &[&str] = &["ping", "healthz", "info", "register"];
+
+/// Fiber-compatible path normalization: trim all trailing slashes unless
+/// `--strict-routing` (fiber: `utils.TrimRightBytes(detectionPath, '/')`),
+/// then canonicalize static segments to lowercase unless `--case-sensitive`
+/// (fiber matches the lowercased detection path but keeps param case).
 fn detection_path_for(path: &str, case_sensitive: bool, strict_routing: bool) -> String {
-    let mut detection_path = path.to_string();
-    if !case_sensitive {
-        detection_path = detection_path.to_lowercase();
-    }
+    let mut trimmed = path;
     if !strict_routing {
-        while detection_path.len() > 1 && detection_path.ends_with('/') {
-            detection_path.pop();
+        while trimmed.len() > 1 && trimmed.ends_with('/') {
+            trimmed = &trimmed[..trimmed.len() - 1];
         }
     }
-    detection_path
+    if case_sensitive {
+        return trimmed.to_string();
+    }
+    // Canonicalize recognized static segments; keep everything else verbatim.
+    let mut out = String::with_capacity(trimmed.len());
+    for (i, segment) in trimmed.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if STATIC_SEGMENTS
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(segment))
+        {
+            out.push_str(&segment.to_lowercase());
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
 }
 
 /// The application service: the route [`Router`] wrapped with Basic Auth
@@ -284,6 +327,14 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
         .route("/ping", get_route(misc::ping))
         .route("/healthz", get_route(misc::healthz))
         .route("/info", get_route(misc::info))
+        .route(
+            "/register",
+            post_get_route(register::register_post, register::register_compat_get),
+        )
+        .route(
+            "/register/{device_key}",
+            get_route(register::register_check),
+        )
         .fallback(not_found)
         .with_state(state.clone());
 

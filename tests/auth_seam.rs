@@ -197,13 +197,13 @@ async fn exempt_routes_pass_without_credentials() {
     assert_eq!(healthz.status(), 200, "/healthz must be auth-free");
     assert_eq!(healthz.text().await.unwrap(), "ok");
 
-    // /register has no route in this ticket's skeleton; the observable
-    // exemption is that it does NOT 418 but falls through to the enveloped
-    // 404 (upstream: the register route itself answers there).
+    // /register is itself an exempt route: without credentials it reaches
+    // the register handler, which answers the upstream bind validation
+    // (400 "device token is empty") — crucially NOT the 418 teapot.
     let register = http.get(server.url("/register")).send().await.unwrap();
-    assert_eq!(register.status(), 404, "/register must be exempt, not 418");
+    assert_eq!(register.status(), 400, "/register must be exempt, not 418");
     let body: serde_json::Value = register.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /register");
+    assert_envelope_no_data(&body, 400, "device token is empty");
     server.shutdown().await;
 }
 
@@ -357,8 +357,10 @@ async fn auth_under_non_root_url_prefix() {
     // Exemptions are joined with the prefix.
     let ping = http.get(server.url("/ping")).send().await.unwrap();
     assert_eq!(ping.status(), 200, "/bark/ping must be exempt");
+    // The exempt register route answers under the prefix (400 from the
+    // register handler's bind validation — not the 418 teapot).
     let register = http.get(server.url("/register")).send().await.unwrap();
-    assert_eq!(register.status(), 404, "/bark/register exempt, not 418");
+    assert_eq!(register.status(), 400, "/bark/register exempt, not 418");
     let healthzz = http.get(server.url("/healthzz")).send().await.unwrap();
     assert_eq!(healthzz.status(), 404, "joined byte-prefix exemption");
     let pingpong = http.get(server.url("/pingpong")).send().await.unwrap();
