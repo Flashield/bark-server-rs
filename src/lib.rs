@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod config;
+pub mod random;
 pub mod server;
 pub mod shortuuid;
 pub mod store;
