@@ -11,6 +11,7 @@ use axum::ServiceExt;
 use crate::api;
 use crate::apns::ApnsClient;
 use crate::config::Config;
+use crate::events::EventBus;
 use crate::store::{SqliteStore, Store};
 
 #[derive(Clone)]
@@ -19,6 +20,16 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     /// APNs delivery client (endpoint from `--apns-endpoint`).
     pub apns: Arc<ApnsClient>,
+    /// Transport-agnostic event bus (ADR-0001): the push pipeline persists
+    /// through it and the SSE streams subscribe to it.
+    pub events: Arc<EventBus>,
+    /// Flips to `true` when the shutdown signal fires. Long-lived responses
+    /// (the SSE streams) watch it so graceful shutdown can complete instead
+    /// of waiting on connections that would otherwise never end.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// MCP tool servers behind `/mcp` and `/mcp/:device_key` (src/mcp.rs);
+    /// per-instance session tables with the configured idle TTL.
+    pub mcp: crate::mcp::McpRegistry,
 }
 
 /// Future resolving on SIGINT or SIGTERM (upstream's graceful shutdown
@@ -53,16 +64,38 @@ pub async fn run_server(
     config: Config,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    // Notify in-flight long-lived responses (SSE streams) about the shutdown
+    // signal so they can end and let the graceful shutdown complete.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown = {
+        let tx = shutdown_tx.clone();
+        async move {
+            shutdown.await;
+            let _ = tx.send(true);
+        }
+    };
+
     // Upstream: initializeDatabase before startServer (ReCreateAPNS runs in
     // upstream's init(); the client is built here from the config instead,
     // which is equivalent since no connection is made until a push).
-    let store = SqliteStore::open(&config.data_dir)
+    // Retention (ticket 08, ADR-0002): the additive flags are seconds/count
+    // with 0 = limit disabled (MessageRetention::from_limits).
+    let retention = crate::store::MessageRetention::from_limits(
+        config.sse_message_ttl_secs,
+        config.sse_message_cap,
+    );
+    let store = SqliteStore::open(&config.data_dir, retention)
         .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?;
+    let store: Arc<dyn Store> = Arc::new(store);
     let apns = ApnsClient::from_config(&config).context("failed to initialize APNs client")?;
+    let mcp = crate::mcp::McpRegistry::new(config.mcp_session_idle_ttl);
     let state = AppState {
         config: Arc::new(config.clone()),
-        store: Arc::new(store),
+        events: Arc::new(EventBus::new(store.clone())),
+        store,
         apns: Arc::new(apns),
+        shutdown: shutdown_rx,
+        mcp,
     };
     let app_service = api::build_app_service(&state);
     let db_label = format!("sqlite({})", config.data_dir.display());

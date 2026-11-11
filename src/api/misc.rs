@@ -27,13 +27,24 @@ pub async fn healthz() -> String {
 
 /// `GET /info` — server build info plus the live device count from the store.
 /// Upstream ignores a count error (`devices, _ := db.CountAll()`) → 0.
+///
+/// The spec pre-agreed additive realtime stats: `streams` (Stream Tokens
+/// minted, revoked included), `active_streams` (SSE connections currently
+/// open) and `pending_messages` (stored Pushes awaiting replay). Count
+/// errors degrade to 0 like upstream's.
 pub async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
     let devices = state.store.count_devices().unwrap_or(0);
+    let streams = state.store.count_stream_tokens().unwrap_or(0);
+    let pending_messages = state.store.count_messages().unwrap_or(0);
+    let active_streams = state.events.active_streams();
     Json(json!({
         "version": crate::VERSION,
         "build": crate::BUILD_DATE,
         "arch": crate::go_arch(),
         "commit": crate::COMMIT_ID,
         "devices": devices,
+        "streams": streams,
+        "active_streams": active_streams,
+        "pending_messages": pending_messages,
     }))
 }

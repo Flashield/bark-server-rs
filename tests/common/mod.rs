@@ -7,6 +7,7 @@
 #![allow(dead_code)] // helpers are shared per test-target, not all used everywhere
 
 pub mod apns_stub;
+pub mod sse_client;
 
 use std::time::Duration;
 

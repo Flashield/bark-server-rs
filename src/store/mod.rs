@@ -2,10 +2,26 @@
 //! second backend per ADR-0005) and the embedded SQLite implementation
 //! (rusqlite, bundled) holding the single file under the configured data
 //! directory, mirroring upstream's bbolt deployment shape.
+//!
+//! The per-device message store (ADR-0002) is bounded by a retention policy
+//! ([`MessageRetention`], ticket 08): a per-device TTL (default 72h) and a
+//! per-device cap (default 1000), both configurable via
+//! `--sse-message-ttl-secs` / `--sse-message-cap` (0 = limit disabled).
+//! Pruning is lazy — on insert, the inserting Device's expired and over-cap
+//! rows are deleted under the same store lock; there is no background
+//! sweeper. The replay boundary is still exact: the replay scan
+//! (`Store::messages_after`) and the retained count (`Store::count_messages`)
+//! ignore TTL-expired rows even before the lazy pruning removed them, so an
+//! expired message is never replayed and never counted, and a cap overflow
+//! only exists between two inserts of the same Device. The
+//! `device_message_seq` counter is independent of the messages table, so
+//! pruning never regresses or reuses ids.
 
 mod sqlite;
 
 pub use sqlite::SqliteStore;
+
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -81,6 +97,78 @@ pub enum RevokeOutcome {
     AlreadyRevoked,
 }
 
+/// Per-Device retention policy of the message store (ADR-0002, ticket 08):
+/// how much replay history a Device keeps. `ttl` prunes messages older than
+/// the age; `cap` bounds the per-Device count, dropping oldest first (ids
+/// are monotonic, so id order is age order). `None` disables the limit —
+/// `Some(0)` must never be constructed (a zero cap would retain nothing).
+///
+/// The spec defaults live in [`MessageRetention::default`]; the additive
+/// config flags map onto this via [`MessageRetention::from_limits`].
+#[derive(Debug, Clone, Copy)]
+pub struct MessageRetention {
+    /// Maximum age of a retained message; `None` = no TTL pruning.
+    pub ttl: Option<Duration>,
+    /// Maximum number of retained messages per Device; `None` = no cap.
+    pub cap: Option<i64>,
+}
+
+impl Default for MessageRetention {
+    /// The spec defaults: 72h TTL, 1000 messages per Device.
+    fn default() -> Self {
+        Self {
+            ttl: Some(Duration::from_secs(72 * 60 * 60)),
+            cap: Some(1000),
+        }
+    }
+}
+
+impl MessageRetention {
+    /// Map the additive config knobs (`--sse-message-ttl-secs` /
+    /// `--sse-message-cap`, both 0 = limit disabled) onto the policy.
+    pub fn from_limits(ttl_secs: u64, cap: u64) -> Self {
+        Self {
+            ttl: (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs)),
+            cap: (cap > 0).then_some(cap as i64),
+        }
+    }
+
+    /// The TTL expiry cutoff for a message created `created_at`: retained
+    /// iff `created_at >= cutoff`. Shared by the insert-time prune and the
+    /// replay/count filters so all three draw the same line.
+    pub fn ttl_cutoff_at(&self, created_at: i64) -> Option<i64> {
+        self.ttl
+            .map(|ttl| created_at.saturating_sub(ttl.as_secs() as i64))
+    }
+}
+
+/// A Push to persist, before the store assigns its per-device monotonic id
+/// (the exact payload the spec's `messages` table stores: title, subtitle,
+/// body, Ext Params JSON, Device Key; `created_at` is assigned by the store).
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    pub device_key: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    /// Ext Params serialized as a JSON object (keys lowercased, values
+    /// stringified per the push core's rules; `{}` when empty).
+    pub ext_params: String,
+}
+
+/// A persisted Push: [`NewMessage`] plus the assigned per-device monotonic
+/// id and the server-side creation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRecord {
+    pub device_key: String,
+    pub id: i64,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub ext_params: String,
+    pub created_at: i64,
+}
+
 /// Persistence for Devices (and, in later tickets, Stream Tokens and pending
 /// messages). Sync on purpose: SQLite calls are short and the connection is
 /// mutex-guarded; callers on the async runtime should keep using it for
@@ -89,6 +177,43 @@ pub enum RevokeOutcome {
 pub trait Store: Send + Sync {
     /// Number of registered Devices; backs `/info`'s `devices` field.
     fn count_devices(&self) -> Result<i64, StoreError>;
+
+    /// Number of minted Stream Tokens (all of them, revoked included — the
+    /// `active_streams` stat covers liveness); backs `/info`'s `streams`.
+    fn count_stream_tokens(&self) -> Result<i64, StoreError>;
+
+    /// Number of retained (pending) messages across all Devices; backs
+    /// `/info`'s `pending_messages`. Retention-aware (ticket 08): rows
+    /// expired under the configured TTL never count, even before the lazy
+    /// insert-time pruning removed them — pending_messages is the count of
+    /// what replay could return. Cap overflow only exists between two
+    /// inserts of the same Device (pruned on the next insert).
+    fn count_messages(&self) -> Result<i64, StoreError>;
+
+    /// Persist a Push to the per-device message store (ADR-0002) and return
+    /// the full record. The per-device monotonic id is assigned here — from
+    /// the `device_message_seq` counter, which never regresses even when
+    /// retention pruning removes rows — and `created_at` is the assignment
+    /// time. Callers persist BEFORE fan-out.
+    ///
+    /// Also performs the Device's lazy retention pruning (ticket 08): right
+    /// after the insert, the Device's TTL-expired and over-cap rows are
+    /// deleted under the same store lock.
+    fn insert_message(&self, message: &NewMessage) -> Result<MessageRecord, StoreError>;
+
+    /// Every retained message for `device_key` with per-device id >
+    /// `after_id`, in ascending id order — the replay scan behind
+    /// `Last-Event-ID` (ADR-0002, ticket 08). Retention bounds the result:
+    /// rows expired under the configured TTL are never returned even before
+    /// the lazy insert-time pruning removed them, and the per-Device cap
+    /// bounds the count — so no artificial scan limit applies. An
+    /// `after_id` older than the retained floor therefore replays from the
+    /// oldest retained message.
+    fn messages_after(
+        &self,
+        device_key: &str,
+        after_id: i64,
+    ) -> Result<Vec<MessageRecord>, StoreError>;
 
     /// Create or update the Device Record for `key`, mirroring upstream
     /// `SaveDeviceTokenByKey`: when `key` is empty or unknown, a new

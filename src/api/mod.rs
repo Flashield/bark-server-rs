@@ -11,7 +11,7 @@
 //!
 //! Basic Auth (see [`auth`]) also runs in [`AppService`], in front of every
 //! route including the fallbacks, exactly like upstream's fiber middleware —
-//! so later MCP/SSE routes inherit it automatically.
+//! so the MCP (`src/mcp.rs`) and SSE routes inherit it automatically.
 //!
 //! The normalization runs in [`AppService`], which wraps the whole `Router`:
 //! `Router::layer` middleware would run *after* routing (see axum's
@@ -22,6 +22,7 @@ pub mod misc;
 pub mod push;
 pub mod realtime;
 pub mod register;
+pub mod sse;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -30,10 +31,11 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{MethodRouter, delete, get, post};
+use axum::routing::{MethodRouter, any, delete, get, post};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 
+use crate::mcp;
 use crate::server::AppState;
 
 /// Upstream `CommonResp` (router.go): `{code, message, data?, timestamp}`.
@@ -175,6 +177,17 @@ where
     delete(handler).fallback(method_not_allowed)
 }
 
+/// `any(...)` — upstream fiber `router.All`: the MCP endpoints are
+/// registered for every HTTP method (the handler dispatches on the method
+/// itself, mirroring net/http's ServeHTTP switch).
+fn any_route<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    any(handler)
+}
+
 pub fn normalized_prefix(url_prefix: &str) -> String {
     let trimmed = url_prefix.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -192,9 +205,12 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
 /// static name, so this is exact for all reachable requests.
 const STATIC_SEGMENTS: &[&str] = &[
     "ping", "healthz", "info", "register", "push",
-    // Realtime credential plane (api/realtime.rs); like the upstream route
-    // names, these match case-insensitively under fiber's default config.
-    "realtime", "v1", "devices", "streams",
+    // Realtime credential plane (api/realtime.rs) and the SSE stream
+    // endpoint (api/sse.rs); like the upstream route names, these match
+    // case-insensitively under fiber's default config.
+    "realtime", "v1", "devices", "streams", "stream",
+    // MCP tool server (src/mcp.rs); upstream registers it with router.All.
+    "mcp",
 ];
 
 /// Fiber-compatible path normalization: trim all trailing slashes unless
@@ -395,6 +411,12 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
                 .fallback(method_not_allowed),
         )
         .route("/push", post_get_route(push::push_post, push::compat_1))
+        // MCP tool server: generic endpoint (device_key as tool argument) and
+        // the path-bound one (device_key injected over the args). All HTTP
+        // methods, like upstream fiber's router.All; src/mcp.rs holds the
+        // contract.
+        .route("/mcp", any_route(mcp::generic))
+        .route("/mcp/{device_key}", any_route(mcp::specific))
         // Realtime credential plane: mint (POST) + list (GET) a Device's
         // Stream Tokens, revoke one by id (DELETE). api/realtime.rs holds
         // the contract.
@@ -406,11 +428,15 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             "/realtime/v1/devices/{device_key}/streams/{token_id}",
             delete_route(realtime::stream_revoke),
         )
+        // The SSE realtime stream: Stream Token auth, live push mirror
+        // (api/sse.rs holds the contract).
+        .route("/realtime/v1/stream", get_route(sse::stream_connect))
         // Legacy compat push routes (upstream `push_compat`, weight 1):
         // GET/POST on 1-4 segment paths, mounted after every canonical
         // route. `GET /push` resolves here upstream (the canonical /push is
         // POST-only), which is why the static route above chains compat_1
-        // as its GET handler.
+        // as its GET handler. Static segments (/mcp, /realtime/v1/stream)
+        // outrank these parameters natively in matchit.
         .route(
             "/{device_key}",
             get(push::compat_1)
