@@ -165,13 +165,19 @@ async fn env_vars_configure_the_server() {
         "env-configured data dir must hold the store file"
     );
 
-    // Case sensitivity honored through the env var.
+    // Case sensitivity honored through the env var: /PING misses the static
+    // /ping route and falls to the compat push with the original-case key.
     let miss = client()
         .get(format!("{}/PING", server.base_url))
         .send()
         .await
         .unwrap();
-    assert_eq!(miss.status(), 404);
+    assert_eq!(miss.status(), 400);
+    let body: Value = miss.json().await.unwrap();
+    assert_eq!(
+        body["message"],
+        "failed to get device token: failed to get [PING] device token from database"
+    );
     let hit = client()
         .get(format!("{}/ping", server.base_url))
         .send()

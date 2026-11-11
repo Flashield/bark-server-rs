@@ -127,10 +127,16 @@ async fn case_sensitive_flag_restores_strict_matching() {
     config.case_sensitive = true;
     let server = TestServer::spawn(config, dir).await;
 
-    let miss = client().get(server.url("/PING")).send().await.unwrap();
+    // Static routes stop matching case-insensitively; five-segment paths stay
+    // unmatched (the compat routes only cover up to four segments).
+    let miss = client()
+        .get(server.url("/PING/a/b/c/d"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(miss.status(), 404);
     let body: Value = miss.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /PING");
+    assert_envelope_no_data(&body, 404, "Cannot GET /PING/a/b/c/d");
 
     let hit = client().get(server.url("/ping")).send().await.unwrap();
     assert_eq!(hit.status(), 200);
@@ -155,12 +161,11 @@ async fn strict_routing_flag_disables_trailing_slash_tolerance() {
 
 #[tokio::test]
 async fn unmatched_routes_get_enveloped_404() {
+    // The compat routes (ticket 04) claim every 1-4 segment path, so the
+    // enveloped 404 remains only for five or more segments — with the
+    // original path in the message, like fiber's pathOriginal.
     let server = spawn().await;
-    let res = client()
-        .get(server.url("/nonexistent"))
-        .send()
-        .await
-        .unwrap();
+    let res = client().get(server.url("/a/b/c/d/e")).send().await.unwrap();
     assert_eq!(res.status(), 404);
     assert_eq!(
         res.headers().get("content-type").unwrap(),
@@ -168,23 +173,23 @@ async fn unmatched_routes_get_enveloped_404() {
     );
     assert_eq!(server_header(&res), "Bark");
     let body: Value = res.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /nonexistent");
-
-    // Multi-segment paths likewise, with the original path in the message.
-    let res = client().get(server.url("/a/b/c")).send().await.unwrap();
-    assert_eq!(res.status(), 404);
-    let body: Value = res.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /a/b/c");
+    assert_envelope_no_data(&body, 404, "Cannot GET /a/b/c/d/e");
     server.shutdown().await;
 }
 
 #[tokio::test]
-async fn percent_encoded_paths_pass_through_to_404_message() {
+async fn percent_encoded_paths_pass_through_to_compat_push() {
+    // One-segment paths resolve as compat pushes with the raw (un-decoded)
+    // device key — verified against the upstream Go server.
     let server = spawn().await;
     let res = client().get(server.url("/a%3Cb")).send().await.unwrap();
-    assert_eq!(res.status(), 404);
+    assert_eq!(res.status(), 400);
     let body: Value = res.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /a%3Cb");
+    assert_envelope_no_data(
+        &body,
+        400,
+        "failed to get device token: failed to get [a%3Cb] device token from database",
+    );
     server.shutdown().await;
 }
 

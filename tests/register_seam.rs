@@ -684,11 +684,10 @@ async fn check_route_trailing_slash_falls_back_to_compat_query_route() {
 #[tokio::test]
 async fn register_method_mismatches_get_enveloped_405() {
     let server = spawn().await;
-    for (path, method) in [
-        ("/register", "DELETE"),
-        ("/register", "PUT"),
-        ("/register/somekey", "POST"),
-    ] {
+    // POST /register/{key} is NOT a 405: with the compat push routes mounted,
+    // the two segments fall through to the compat push (device_key="register")
+    // — covered by push_seam's compat_routes_do_not_shadow_canonical_routes.
+    for (path, method) in [("/register", "DELETE"), ("/register", "PUT")] {
         let res = client()
             .request(
                 reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
