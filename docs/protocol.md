@@ -69,12 +69,8 @@ send the `Authorization` header alongside its `X-Stream-Token`.
 
 This section is the drop-in compatibility promise (ADR-0003): the official
 Bark iOS App and existing scripts keep working unchanged. Semantics are
-upstream bark-server v2.4.0's, audited route by route.
-
-> Status note: the path-style compat routes (§2.4) and batch pushes (§2.5)
-> are defined here at the upstream-guaranteed level and land in the compat
-> ticket; `POST /push` (JSON), registration, misc routes and Basic Auth are
-> shipped and the examples below were captured from a running server.
+upstream bark-server v2.4.0's, audited route by route; every example below
+was captured from a running server.
 
 ### 2.1 Register a Device
 
@@ -195,6 +191,10 @@ Behavioral guarantees:
   string in `message` (an APNs `413 PayloadTooLarge` answers
   `{"code":413,"message":"PayloadTooLarge",...}`); transport-level failures
   answer `500 push failed: {detail}`.
+- A JSON `null` body combined with query args or path parameters answers
+  `500 assignment to entry in nil map` (upstream panics assigning into the
+  nil map its `json.Unmarshal` produces); a bare `null` body without
+  query/path reaches the ordinary empty-key error.
 
 A non-JSON Content-Type on `POST /push` selects the V1 collection (§2.4).
 
@@ -225,8 +225,7 @@ server's additive extension; the first four fields match upstream):
 ### 2.4 Compat Routes (path-style, V1)
 
 The legacy URL shapes — byte-compatible with old scripts, iOS Shortcuts and
-one-liners. Both `GET` and `POST` work on each shape; segments after
-`device_key` are URL-unescaped path parameters:
+one-liners. Both `GET` and `POST` work on each shape:
 
 | Shape | Binds |
 |---|---|
@@ -239,33 +238,49 @@ one-liners. Both `GET` and `POST` work on each shape; segments after
 curl "http://127.0.0.1:8080/sPpZNe2sDTzsKMqyaiw85i/Flight/Gate%207"
 ```
 
-Rules (upstream v2.4.0):
+Rules (upstream v2.4.0, verified against the shipped server):
 
-- Path parameters have the highest precedence, then query args, then (for
-  POST) the body.
-- More than four path segments → fiber's enveloped 404
-  (`Cannot GET /a/b/c/d/e`).
+- Path parameters have the highest precedence, then query args, then the
+  collected body (V1 collection, below).
+- `body`/`title`/`subtitle` segments are URL-unescaped with Go's
+  `url.QueryUnescape` semantics (`%XX` sequences and `+` → space); the
+  `device_key` segment stays raw — percent-escapes and casing preserved. A
+  segment with a malformed escape answers
+  `400 url path parse failed: invalid URL escape "%zz"` (quoting the bad
+  escape).
+- More than four path segments never match → the enveloped 404 with the
+  verbatim path (`Cannot GET /{device_key}/a/b/c/d`).
 - `GET /push` resolves as a Compat Route with `device_key = "push"` (there is
-  no canonical GET on `/push`).
-- A non-JSON Content-Type on `POST /push` selects the V1 collection: query
-  args first (keys lowercased), then form/POST args (keys lowercased), then
-  multipart form values (first value wins, keys **not** lowercased), then
-  path params highest.
-- Path segments failing URL-unescaping → `400 url path parse failed: …`.
+  no canonical GET on `/push`). The same fall-through applies to any
+  canonical route's unhandled method — e.g. `POST /register/{key}` pushes
+  with `device_key = "register"`.
+- A non-JSON Content-Type on `POST /push` — and every compat-route request —
+  uses the V1 collection, in upstream order: query args (keys lowercased) →
+  form POST args (parsed only when the raw content type starts with
+  `application/x-www-form-urlencoded`, any method; keys lowercased) →
+  multipart form values (only for a parseable `multipart/form-data`
+  boundary; keys keep their case, first value wins) → path params highest.
+- `device_keys` is **not** expanded on the V1 path — it rides along as an
+  Ext Param like any unrecognized parameter (upstream parity; batch only
+  exists on the V2 JSON route, §2.5).
 
 ### 2.5 Batch push
 
 `device_keys` on `POST /push` fans one Push out to several Devices:
 
-- A comma-separated **string** (`"key1,key2"`) splits on `,`.
-- A JSON **array** (`["key1","key2"]`) stringifies each element.
+- A comma-separated **string** (`"key1,key2"`) splits on `,` — an empty
+  string splits into one empty key, which runs as a one-item batch whose
+  `data` carries that key's failure item (Go `strings.Split` semantics).
+- A JSON **array** (`["key1","key2"]`) stringifies each element (`123` →
+  `"123"`).
 - Any other type → `400 invalid type for device_keys`.
-- Zero resulting keys → ordinary single push.
+- No `device_keys` parameter at all → ordinary single push.
 - More keys than `--max-batch-push-count` (default `-1` = unlimited) →
   `400 batch push count exceeds the maximum limit: {N}`.
 
-The response is HTTP 200 with `data` = one result object per target, in
-request order; `message` appears only on failure:
+The response is HTTP 200 (even when every item failed) with `data` = one
+result object per target, in request order; `message` appears only on
+failure:
 
 ```json
 {"code":200,"message":"success","timestamp":1760000000,"data":[
@@ -275,7 +290,7 @@ request order; `message` appears only on failure:
 ```
 
 Targets are pushed concurrently; each result carries that target's own
-outcome.
+outcome. Realtime mirroring and replay apply per target as usual (§3.4).
 
 ## 3. Realtime API v1 — `/realtime/v1`
 
@@ -622,7 +637,7 @@ compat/realtime table:
 | 400 | `failed to get device token: device token invalid` | Push to a Device whose token APNs blanked |
 | 400 | `invalid type for device_keys` | Batch `device_keys` neither string nor array |
 | 400 | `batch push count exceeds the maximum limit: {N}` | Batch over `--max-batch-push-count` |
-| 400 | `url path parse failed: {detail}` | Compat Route segment fails URL-unescaping |
+| 400 | `url path parse failed: invalid URL escape "{escape}"` | Compat Route segment fails URL-unescaping |
 | 400 | `request bind failed: {detail}` | Push body/query binding failed |
 | 400 | `request bind failed2: {detail}` | Register body binding failed (the `2` is upstream's) |
 | 400 | `device token is empty` / `device token is invalid` | Register validation |
@@ -637,6 +652,7 @@ compat/realtime table:
 | 409 | `stream token already revoked` | Revoking twice |
 | 418 | plain text `I'm a teapot` | Basic Auth failure (§1.4) |
 | 500 | `push failed: {detail}` | APNs transport failure |
+| 500 | `assignment to entry in nil map` | V2 push with a JSON `null` body plus query args or path params (upstream panic parity) |
 | 500 | `message store failed: {detail}` | Replay-store write failed on push |
 | 500 | `stream token storage failed: {detail}` / `stream token lookup failed: {detail}` | Store failure on the realtime plane |
 
