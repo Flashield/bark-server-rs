@@ -16,7 +16,12 @@ use bark_server_rs::config::Config;
 use serde_json::Value;
 
 /// Pick a free TCP port by binding to 0 and dropping the listener.
-/// The tiny race is acceptable for tests; readiness polling covers slow starts.
+///
+/// Racy by design (the port is free again between drop and the next bind),
+/// so prefer handing a bound listener to the server via
+/// [`TestServer::spawn`]/`run_server_on_listener` — only the `cli_seam`
+/// subprocess spawns need this (the binary binds its own port; there is no
+/// fd to hand over). Readiness polling covers slow starts there.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -49,12 +54,29 @@ impl TestServer {
     }
 
     async fn spawn_at(config: Config, dir: Option<tempfile::TempDir>) -> Self {
-        let base_url = format!("http://{}", config.addr);
+        // Bind the port HERE and hand the listener to the server
+        // (run_server_on_listener): the port is held from allocation through
+        // serve, so (a) the kernel's ephemeral allocation can never hand the
+        // same port to a concurrent test's free_port() — in-use ports are
+        // skipped — and (b) this server can never lose its port to another
+        // test's bind in the window before it listens. The old pick-a-port-
+        // and-pray helper raced exactly that window; under parallel load two
+        // tests could collide, one boot failed, and wait_ready then talked to
+        // the other test's server — the observed restart-test flakiness.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut config = config;
+        config.addr = addr.to_string();
+        let base_url = format!("http://{addr}");
         let url_prefix = bark_server_rs::api::normalized_prefix(&config.url_prefix);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(bark_server_rs::run_server(config, async move {
-            let _ = rx.await;
-        }));
+        let handle = tokio::spawn(bark_server_rs::run_server_on_listener(
+            listener,
+            config,
+            async move {
+                let _ = rx.await;
+            },
+        ));
         wait_ready(&format!("{base_url}{url_prefix}/ping")).await;
         Self {
             base_url,

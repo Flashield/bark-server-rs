@@ -34,6 +34,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{MethodRouter, any, delete, get, post};
 use pin_project_lite::pin_project;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::mcp;
 use crate::server::AppState;
@@ -76,6 +77,90 @@ pub fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_secs() as i64
+}
+
+/// Generous read cap (fasthttp's default request body limit) for the manual
+/// body reads on the register/push/realtime/MCP routes; request bodies are
+/// tiny in practice.
+pub(crate) const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// The JSON type name used in bind-failure messages (Go's encoding/json
+/// wording: "cannot unmarshal <kind> into ...").
+pub(crate) fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// The invalid-escape policy of [`percent_decode`], matching the two upstream
+/// call sites.
+#[derive(Clone, Copy)]
+pub(crate) enum PercentDecodePolicy {
+    /// fasthttp form/query semantics (register bodies and query strings):
+    /// invalid escape sequences pass through verbatim.
+    PassThrough,
+    /// Go's `url.QueryUnescape` (compat-route path segments): the first
+    /// invalid escape fails the decode.
+    GoQueryUnescape,
+}
+
+/// Percent-decode with `+` as space, shared by the register form/query bind
+/// ([`PercentDecodePolicy::PassThrough`]) and the compat-route
+/// subtitle/title/body segments ([`PercentDecodePolicy::GoQueryUnescape`]).
+///
+/// `%XX` accepts exactly two ASCII hex digits (Go's `unhex`); anything else —
+/// a truncated escape, a non-hex byte, a `+`/`-` sign-looking character — is
+/// invalid. Decoded bytes that are not valid UTF-8 are replaced (Go marshals
+/// invalid UTF-8 as U+FFFD downstream).
+pub(crate) fn percent_decode(s: &str, policy: PercentDecodePolicy) -> Result<String, String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3).and_then(|pair| {
+                    let hi = (pair[0] as char).to_digit(16);
+                    let lo = (pair[1] as char).to_digit(16);
+                    hi.zip(lo).map(|(hi, lo)| (hi * 16 + lo) as u8)
+                });
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => match policy {
+                        PercentDecodePolicy::PassThrough => {
+                            out.push(b'%');
+                            i += 1;
+                        }
+                        PercentDecodePolicy::GoQueryUnescape => {
+                            let rest = &bytes[i..];
+                            let end = rest.len().min(3);
+                            return Err(format!(
+                                "invalid URL escape \"{}\"",
+                                String::from_utf8_lossy(&rest[..end])
+                            ));
+                        }
+                    },
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Render an envelope as a JSON response with the given status.

@@ -30,7 +30,10 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{CommonResp, envelope_response, error_envelope};
+use crate::api::{
+    CommonResp, MAX_BODY_BYTES, PercentDecodePolicy, envelope_response, error_envelope, json_kind,
+    percent_decode,
+};
 use crate::server::AppState;
 use crate::store::{DEVICE_TYPE_IOS, DEVICE_TYPE_STREAM, DEVICE_TYPE_WATCHOS};
 
@@ -255,10 +258,6 @@ fn bind_failed(detail: String) -> Response {
     )
 }
 
-/// Generous read cap (fasthttp's default request body limit) for the manual
-/// body read; register bodies are tiny.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-
 /// The body-bind family for a raw Content-Type value, mirroring fiber's
 /// `BodyParser` dispatch: lowercase, vendor-specific `+json`/`+xml`
 /// normalization, parameter cut at `;`, then `json` suffix or exact match.
@@ -330,17 +329,6 @@ fn bind_json(body: &[u8]) -> Result<DeviceInfo, String> {
     Ok(info)
 }
 
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 /// Form body / query string bind: `&`-separated, `=`-split pairs with
 /// percent-decoding (`+` as space). Keys match case-insensitively (gorilla/
 /// schema EqualFold) and the last duplicate wins. Unknown keys are ignored.
@@ -355,53 +343,21 @@ fn bind_pairs(pairs: &[(String, String)]) -> DeviceInfo {
 }
 
 /// Decode an `application/x-www-form-urlencoded` string into pairs (shared
-/// with the push route's query-arg override).
+/// with the push route's query-arg override). Invalid escapes pass through
+/// verbatim (fasthttp form/query semantics — [`PercentDecodePolicy::
+/// PassThrough`], which never fails).
 pub(crate) fn decode_form_pairs(input: &str) -> Vec<(String, String)> {
+    let decode = |s: &str| {
+        percent_decode(s, PercentDecodePolicy::PassThrough)
+            .expect("pass-through percent-decoding never fails")
+    };
     input
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((key, value)) => (decode_component(key), decode_component(value)),
-            None => (decode_component(pair), String::new()),
+            Some((key, value)) => (decode(key), decode(value)),
+            None => (decode(pair), String::new()),
         })
         .collect()
-}
-
-/// Percent-decode with `+` as space (fasthttp form/query semantics); invalid
-/// escape sequences pass through verbatim.
-fn decode_component(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3).and_then(|h| {
-                    std::str::from_utf8(h)
-                        .ok()
-                        .and_then(|h| u8::from_str_radix(h, 16).ok())
-                });
-                match hex {
-                    Some(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    None => {
-                        out.push(b'%');
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// XML body bind (upstream `xml.Unmarshal` with the same struct tags):

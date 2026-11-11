@@ -111,7 +111,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
-use crate::api::{CommonResp, envelope_response, error_envelope};
+use crate::api::{CommonResp, MAX_BODY_BYTES, envelope_response, error_envelope};
 use crate::server::AppState;
 use crate::store::{RevokeOutcome, StoreError, StreamTokenRecord};
 
@@ -135,9 +135,6 @@ const MAX_CLIENT_LABEL_BYTES: usize = 256;
 const TOKEN_HINT_CHARS: usize = 12;
 /// Mint retries on the (statistically negligible) id/secret collision.
 const MINT_ATTEMPTS: usize = 3;
-
-/// Generous read cap for the manual body read; mint bodies are tiny.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// `POST /realtime/v1/devices/{device_key}/streams` — mint a Stream Token.
 pub async fn streams_create(

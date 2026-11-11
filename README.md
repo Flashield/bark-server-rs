@@ -32,7 +32,8 @@ versioned realtime API under `/realtime/v1` (SSE), whose client contract is
   tool for AI agents (Claude Desktop, Cherry Studio, …), wire-compatible with
   upstream.
 - **Single binary, embedded storage**: SQLite (bundled, WAL) in one file
-  `bark.db` under the data dir — zero external services (ADR-0005).
+  `bark.db` under the data dir — zero external services; a `--dsn` switches
+  to PostgreSQL for shared-infrastructure deployments (ADR-0005).
 - **TLS termination** in the server via `--cert`/`--key`, like upstream.
 
 ## Quickstart
@@ -104,6 +105,7 @@ upstream's urfave/cli. TLS: set both `--cert` and `--key`.
 | `--unix-socket` | `BARK_SERVER_UNIX_SOCKET` | `""` | Listen on a Unix socket instead |
 | `--url-prefix` | `BARK_SERVER_URL_PREFIX` | `/` | Serve under a URL prefix |
 | `--data` | `BARK_SERVER_DATA_DIR` | `/data` | Data directory (SQLite file `bark.db`) |
+| `--dsn` | `BARK_SERVER_DSN` | `""` | PostgreSQL connection string (libpq URL or keyword/value) — selects the PostgreSQL backend; absent → the embedded SQLite default. Deliberate deviation: upstream's `--dsn` activated MySQL, replaced by PostgreSQL per ADR-0005 (no direct upstream-DB migration path); upstream's `--mysql-tls-*` flags are dropped |
 | `--cert` / `--key` | `BARK_SERVER_CERT` / `BARK_SERVER_KEY` | `""` | TLS certificate/key (both set → HTTPS) |
 | `--case-sensitive` | `BARK_SERVER_CASE_SENSITIVE` | `false` | Case-sensitive routing (default is fiber-compatible tolerant) |
 | `--strict-routing` | `BARK_SERVER_STRICT_ROUTING` | `false` | Trailing slashes stop being ignored |
@@ -111,7 +113,7 @@ upstream's urfave/cli. TLS: set both `--cert` and `--key`.
 | `--user` / `--password` | `BARK_SERVER_BASIC_AUTH_USER` / `BARK_SERVER_BASIC_AUTH_PASSWORD` | `""` | Basic Auth (either alone enables; 418 on failure) |
 | `--proxy-header` | `BARK_SERVER_PROXY_HEADER` | `""` | Header carrying the client IP behind a reverse proxy |
 | `--max-batch-push-count` | `BARK_SERVER_MAX_BATCH_PUSH_COUNT` | `-1` | Batch push cap (`-1` = unlimited) |
-| `--max-apns-client-count` | `BARK_SERVER_MAX_APNS_CLIENT_COUNT` | `1` | APNs HTTP/2 client connections |
+| `--max-apns-client-count` | `BARK_SERVER_MAX_APNS_CLIENT_COUNT` | `1` | Accepted no-op (reqwest multiplexes the HTTP/2 connection) |
 | `--apns-endpoint` | `BARK_SERVER_APNS_ENDPOINT` | `https://api.push.apple.com` | APNs base URL (additive; stub injection for tests) |
 | `--apns-insecure-skip-tls-verify` | `BARK_SERVER_APNS_INSECURE_SKIP_TLS_VERIFY` | `false` | Skip APNs TLS verification (additive; for self-signed stubs) |
 | `--sse-keepalive-secs` | `BARK_SERVER_SSE_KEEPALIVE_SECS` | `15` | Seconds between SSE `: keep-alive` comments (`0` disables) |
@@ -120,8 +122,9 @@ upstream's urfave/cli. TLS: set both `--cert` and `--key`.
 
 Hidden parity knobs (accepted, upstream-compatible): `--concurrency`,
 `--read-timeout`, `--write-timeout`, `--idle-timeout`, and the additive
-`--mcp-session-idle-ttl` (default `10m`). Upstream's MySQL/serverless flags
-belong to backends this project deliberately dropped (ADR-0005).
+`--mcp-session-idle-ttl` (default `10m`). Upstream's `--mysql-tls-*` flags
+and its serverless backend stay dropped; `--dsn` above deliberately
+activates PostgreSQL instead of upstream's MySQL (ADR-0005).
 
 ## Attribution
 

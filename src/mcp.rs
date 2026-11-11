@@ -59,6 +59,7 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
+use crate::api::MAX_BODY_BYTES;
 use crate::api::push::push_core;
 use crate::server::AppState;
 
@@ -78,9 +79,6 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
 const MCP_SESSION_ID_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
-
-/// Generous read cap, matching the push/register routes.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// The two tool servers. Sessions are per-instance, exactly like upstream's
 /// two `StreamableHTTPServer`s.
@@ -238,7 +236,7 @@ impl McpServer {
             if !is_session_id(&id) {
                 return text_error(StatusCode::NOT_FOUND, "Invalid session ID");
             }
-            match self.sessions.validate_and_touch(&id) {
+            match self.sessions.validate(&id, true) {
                 SessionCheck::Active => id,
                 SessionCheck::Terminated => {
                     return text_error(StatusCode::NOT_FOUND, "Session terminated");
@@ -314,7 +312,7 @@ impl McpServer {
         if !is_session_id(sid) {
             return text_error(StatusCode::NOT_FOUND, "Invalid session ID");
         }
-        match self.sessions.validate_without_touch(sid) {
+        match self.sessions.validate(sid, false) {
             SessionCheck::Terminated => text_error(StatusCode::NOT_FOUND, "Session terminated"),
             SessionCheck::Unknown => text_error(
                 StatusCode::NOT_FOUND,
@@ -520,7 +518,10 @@ impl SessionTable {
 
     /// Mint a fresh session id and register it (upstream's initialize path).
     fn mint(&self) -> String {
-        let id = format!("{SESSION_ID_PREFIX}{}", uuid_v4());
+        let id = format!(
+            "{SESSION_ID_PREFIX}{}",
+            crate::shortuuid::new_uuid_v4_string()
+        );
         self.shared
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -530,33 +531,21 @@ impl SessionTable {
         id
     }
 
-    /// Validate a presented session id and refresh its idle timer.
-    fn validate_and_touch(&self, id: &str) -> SessionCheck {
+    /// Validate a presented session id; `touch` refreshes the idle timer
+    /// (the ordinary request path) or not (the sampling-response path never
+    /// touches). Expired sessions are evicted either way.
+    fn validate(&self, id: &str, touch: bool) -> SessionCheck {
         let mut state = self.shared.lock().unwrap_or_else(|p| p.into_inner());
         if state.terminated.contains(id) {
             return SessionCheck::Terminated;
         }
         match state.active.get(id) {
             Some(&last) if last.elapsed() <= self.idle_ttl => {
-                state.active.insert(id.to_string(), Instant::now());
+                if touch {
+                    state.active.insert(id.to_string(), Instant::now());
+                }
                 SessionCheck::Active
             }
-            Some(_) => {
-                state.active.remove(id);
-                SessionCheck::Unknown
-            }
-            None => SessionCheck::Unknown,
-        }
-    }
-
-    /// Validate without refreshing (the sampling-response path never touches).
-    fn validate_without_touch(&self, id: &str) -> SessionCheck {
-        let mut state = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-        if state.terminated.contains(id) {
-            return SessionCheck::Terminated;
-        }
-        match state.active.get(id) {
-            Some(&last) if last.elapsed() <= self.idle_ttl => SessionCheck::Active,
             Some(_) => {
                 state.active.remove(id);
                 SessionCheck::Unknown
@@ -622,23 +611,6 @@ fn is_canonical_uuid(s: &str) -> bool {
         }
     }
     true
-}
-
-/// A random v4 UUID from the OS CSPRNG (version/variant bits set).
-fn uuid_v4() -> String {
-    let mut b = [0u8; 16];
-    crate::random::fill(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 // ---------------------------------------------------------------------------

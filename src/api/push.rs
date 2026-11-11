@@ -63,7 +63,10 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 use serde_json::{Map, Value, json};
 
-use crate::api::{CommonResp, CompatSegments, envelope_response, error_envelope};
+use crate::api::{
+    CommonResp, CompatSegments, MAX_BODY_BYTES, PercentDecodePolicy, envelope_response,
+    error_envelope, json_kind, percent_decode,
+};
 use crate::apns::{self, PushMessage};
 use crate::server::AppState;
 
@@ -369,55 +372,19 @@ fn extract_url_path_params(raw: &[(&'static str, String)]) -> Result<Map<String,
         if let Some(value) = get(name)
             && !value.is_empty()
         {
-            params.insert(name.into(), Value::String(query_unescape(&value)?));
+            // Go `url.QueryUnescape` (query-component mode): invalid escapes
+            // fail with `invalid URL escape "..."` quoting the remainder
+            // truncated to at most 3 bytes (Go's `EscapeError`).
+            params.insert(
+                name.into(),
+                Value::String(percent_decode(
+                    &value,
+                    PercentDecodePolicy::GoQueryUnescape,
+                )?),
+            );
         }
     }
     Ok(params)
-}
-
-/// Go `url.QueryUnescape` (query-component mode): `+` → space, `%XX` →
-/// byte, invalid escapes fail with `invalid URL escape "..."` quoting the
-/// remainder truncated to at most 3 bytes (Go's `EscapeError`). Decoded
-/// bytes that are not valid UTF-8 are replaced (Go marshals invalid UTF-8
-/// as U+FFFD downstream).
-fn query_unescape(s: &str) -> Result<String, String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3).and_then(|pair| {
-                    let hi = (pair[0] as char).to_digit(16);
-                    let lo = (pair[1] as char).to_digit(16);
-                    hi.zip(lo).map(|(hi, lo)| (hi * 16 + lo) as u8)
-                });
-                match hex {
-                    Some(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    None => {
-                        let rest = &bytes[i..];
-                        let end = rest.len().min(3);
-                        return Err(format!(
-                            "invalid URL escape \"{}\"",
-                            String::from_utf8_lossy(&rest[..end])
-                        ));
-                    }
-                }
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// fasthttp `MultipartFormBoundary`: the raw content type must start with
@@ -774,21 +741,9 @@ fn bind_json_params(body: &[u8]) -> Result<ParamsBind, String> {
         Ok(Value::Null) => Ok(ParamsBind::Nil),
         Ok(other) => Err(format!(
             "json: cannot unmarshal {} into Go value of type map[string]interface {{}}",
-            go_json_kind(&other)
+            json_kind(&other)
         )),
         Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Go's JSON type name for the unmarshal-error message.
-fn go_json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
     }
 }
 
@@ -809,7 +764,3 @@ fn extract_device_keys(
         _ => Err((StatusCode::BAD_REQUEST, "invalid type for device_keys")),
     }
 }
-
-/// Generous read cap (fasthttp's default request body limit), matching the
-/// register route's manual body read.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;

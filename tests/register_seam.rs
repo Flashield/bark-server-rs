@@ -344,6 +344,19 @@ async fn post_unsupported_content_type_is_upstream_bind_failure() {
     assert_eq!(res.status(), 400);
     let body: Value = res.json().await.unwrap();
     assert_envelope_no_data(&body, 400, "request bind failed2: Unprocessable Entity");
+
+    // multipart/form-data is deliberately NOT bound (ADR-0003 documented
+    // deviation: no known Bark client registers via multipart) — the same
+    // bind failure answers, well-formed boundary or not.
+    let res = client()
+        .post(server.url("/register"))
+        .multipart(reqwest::multipart::Form::new().text("device_token", "tokMultipart"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert_envelope_no_data(&body, 400, "request bind failed2: Unprocessable Entity");
     server.shutdown().await;
 }
 

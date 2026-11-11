@@ -110,6 +110,203 @@ async fn routes_match_case_insensitively_by_default() {
     server.shutdown().await;
 }
 
+/// Guard for `STATIC_SEGMENTS` (src/api/mod.rs): route matching canonicalizes
+/// only the static segments listed there, so a route registered in the router
+/// but missing from that list still answers at its canonical spelling yet
+/// 404s the moment a client deviates in case or adds a trailing slash — the
+/// silent production breakage this test turns into a CI failure by walking
+/// EVERY documented route (docs/protocol.md) through both tolerances.
+///
+/// Statuses are the handlers' own: a missing `STATIC_SEGMENTS` entry shows up
+/// as the router's enveloped 404, never as one of these.
+#[tokio::test]
+async fn every_documented_route_matches_case_insensitively_and_tolerates_trailing_slashes() {
+    let server = spawn().await;
+
+    // One stream Device drives the parametric routes (pushes to a stream
+    // Device succeed without APNs; token mint/revoke need X-Device-Key).
+    let key = {
+        let res = client()
+            .post(server.url("/register"))
+            .json(&serde_json::json!({"device_type": "stream"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        res.json::<Value>().await.unwrap()["data"]["key"]
+            .as_str()
+            .expect("key string")
+            .to_string()
+    };
+    let mint = |path: String| {
+        let url = server.url(&path);
+        let key = key.clone();
+        async move {
+            client()
+                .post(url)
+                .header("X-Device-Key", &key)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let mint_token_id = |path: String| {
+        let url = server.url(&path);
+        let key = key.clone();
+        async move {
+            client()
+                .post(url)
+                .header("X-Device-Key", &key)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["data"]["token_id"]
+                .as_str()
+                .expect("token_id string")
+                .to_string()
+        }
+    };
+    let revoke = |path: String| {
+        let url = server.url(&path);
+        let key = key.clone();
+        async move {
+            client()
+                .delete(url)
+                .header("X-Device-Key", &key)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let initialize = |path: &str| {
+        let url = server.url(path);
+        async move {
+            client()
+                .post(url)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"guard","version":"0"}}}"#,
+                )
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // --- case-insensitive static segments (every documented route) ---
+    for (path, expected) in [
+        // GET /ping
+        ("/PING", 200),
+        // GET /healthz
+        ("/HEALTHZ", 200),
+        // GET /info
+        ("/INFO", 200),
+    ] {
+        let res = client().get(server.url(path)).send().await.unwrap();
+        assert_eq!(res.status(), expected, "GET {path} must route");
+    }
+    // GET /register (legacy query bind)
+    let res = client()
+        .get(server.url("/REGISTER?devicetoken=tokStaticGuard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "GET /REGISTER must route");
+    // POST /register (body bind)
+    let res = client()
+        .post(server.url("/REGISTER"))
+        .json(&serde_json::json!({"device_type": "stream"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "POST /REGISTER must route");
+    // POST /push (V2; stream Device → no APNs)
+    let res = client()
+        .post(server.url("/PUSH"))
+        .json(&serde_json::json!({"device_key": key, "body": "guard"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "POST /PUSH must route");
+    // POST /realtime/v1/devices/{key}/streams (mint)
+    let res = mint(format!("/Realtime/V1/Devices/{key}/Streams")).await;
+    assert_eq!(
+        res.status(),
+        200,
+        "POST /Realtime/V1/Devices/{{key}}/Streams must route"
+    );
+    let first_token = mint_token_id(format!("/realtime/v1/devices/{key}/streams")).await;
+    // DELETE /realtime/v1/devices/{key}/streams/{token_id} (revoke)
+    let res = revoke(format!("/Realtime/V1/Devices/{key}/Streams/{first_token}")).await;
+    assert_eq!(
+        res.status(),
+        200,
+        "DELETE …/Streams/{{token_id}} must route"
+    );
+    // GET /realtime/v1/stream — a bad token reaches the SSE handler's 401
+    // (a missing STATIC_SEGMENTS entry would be a 404 instead).
+    let res = client()
+        .get(server.url("/Realtime/V1/Stream"))
+        .header("X-Stream-Token", "st_notarealtoken")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "GET /Realtime/V1/Stream must route");
+    // POST /mcp and POST /mcp/{device_key} (initialize)
+    let res = initialize("/MCP").await;
+    assert_eq!(res.status(), 200, "POST /MCP must route");
+    let res = initialize(&format!("/MCP/{key}")).await;
+    assert_eq!(res.status(), 200, "POST /MCP/{{device_key}} must route");
+
+    // --- trailing-slash tolerance (every documented route) ---
+    for path in ["/ping/", "/healthz/", "/info/"] {
+        let res = client().get(server.url(path)).send().await.unwrap();
+        assert_eq!(res.status(), 200, "GET {path} must route");
+    }
+    let res = client()
+        .get(server.url("/register/?devicetoken=tokStaticGuardTrail"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "GET /register/ must route");
+    let res = client()
+        .post(server.url("/push/"))
+        .json(&serde_json::json!({"device_key": key, "body": "guard"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "POST /push/ must route");
+    let second_token = mint_token_id(format!("/realtime/v1/devices/{key}/streams/")).await;
+    let res = mint(format!("/realtime/v1/devices/{key}/streams/")).await;
+    assert_eq!(res.status(), 200, "POST …/streams/ must route");
+    let res = revoke(format!(
+        "/realtime/v1/devices/{key}/streams/{second_token}/"
+    ))
+    .await;
+    assert_eq!(
+        res.status(),
+        200,
+        "DELETE …/streams/{{token_id}}/ must route"
+    );
+    let res = client()
+        .get(server.url("/realtime/v1/stream/"))
+        .header("X-Stream-Token", "st_notarealtoken")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "GET /realtime/v1/stream/ must route");
+    let res = initialize("/mcp/").await;
+    assert_eq!(res.status(), 200, "POST /mcp/ must route");
+    let res = initialize(&format!("/mcp/{key}/")).await;
+    assert_eq!(res.status(), 200, "POST /mcp/{{device_key}}/ must route");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn routes_tolerate_trailing_slashes_by_default() {
     // Upstream trims ALL trailing slashes when strict routing is off.
