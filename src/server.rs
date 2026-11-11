@@ -12,7 +12,7 @@ use crate::api;
 use crate::apns::ApnsClient;
 use crate::config::Config;
 use crate::events::EventBus;
-use crate::store::{SqliteStore, Store};
+use crate::store::{PostgresStore, SqliteStore, Store};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -84,9 +84,22 @@ pub async fn run_server(
         config.sse_message_ttl_secs,
         config.sse_message_cap,
     );
-    let store = SqliteStore::open(&config.data_dir, retention)
-        .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?;
-    let store: Arc<dyn Store> = Arc::new(store);
+    // Backend selection (ticket 12, ADR-0005): --dsn / BARK_SERVER_DSN
+    // activates PostgreSQL (the deliberate replacement for upstream's
+    // MySQL); absent, the embedded SQLite default — single-file, zero
+    // external dependencies — is used.
+    let store: Arc<dyn Store> = if config.dsn.is_empty() {
+        Arc::new(
+            SqliteStore::open(&config.data_dir, retention)
+                .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?,
+        )
+    } else {
+        Arc::new(
+            PostgresStore::open(&config.dsn, retention).context(
+                "failed to open postgres store; check --dsn connectivity and credentials",
+            )?,
+        )
+    };
     let apns = ApnsClient::from_config(&config).context("failed to initialize APNs client")?;
     let mcp = crate::mcp::McpRegistry::new(config.mcp_session_idle_ttl);
     let state = AppState {
@@ -98,7 +111,14 @@ pub async fn run_server(
         mcp,
     };
     let app_service = api::build_app_service(&state);
-    let db_label = format!("sqlite({})", config.data_dir.display());
+    // The log label names the backend only — the DSN carries credentials
+    // and is never echoed (upstream logs its MySQL DSN-free equivalents
+    // similarly).
+    let db_label = if config.dsn.is_empty() {
+        format!("sqlite({})", config.data_dir.display())
+    } else {
+        "postgres".to_string()
+    };
     if !config.cert.is_empty() || !config.key.is_empty() {
         // Upstream: TLS only when BOTH cert and key are set, on TCP.
         if config.cert.is_empty() || config.key.is_empty() {

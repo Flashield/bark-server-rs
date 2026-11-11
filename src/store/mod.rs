@@ -1,24 +1,30 @@
-//! Storage layer: a backend-agnostic `Store` trait (PostgreSQL is the planned
-//! second backend per ADR-0005) and the embedded SQLite implementation
-//! (rusqlite, bundled) holding the single file under the configured data
-//! directory, mirroring upstream's bbolt deployment shape.
+//! Storage layer: a backend-agnostic `Store` trait with two implementations
+//! — the embedded SQLite default (rusqlite, bundled) holding the single
+//! file under the configured data directory, mirroring upstream's bbolt
+//! deployment shape, and the PostgreSQL backend behind `--dsn`
+//! (ticket 12, ADR-0005; the deliberate replacement for upstream's MySQL).
+//! SQLite is used whenever `--dsn` is absent, so the default deployment
+//! stays single-file with zero external dependencies.
 //!
 //! The per-device message store (ADR-0002) is bounded by a retention policy
 //! ([`MessageRetention`], ticket 08): a per-device TTL (default 72h) and a
 //! per-device cap (default 1000), both configurable via
 //! `--sse-message-ttl-secs` / `--sse-message-cap` (0 = limit disabled).
 //! Pruning is lazy — on insert, the inserting Device's expired and over-cap
-//! rows are deleted under the same store lock; there is no background
-//! sweeper. The replay boundary is still exact: the replay scan
-//! (`Store::messages_after`) and the retained count (`Store::count_messages`)
-//! ignore TTL-expired rows even before the lazy pruning removed them, so an
-//! expired message is never replayed and never counted, and a cap overflow
-//! only exists between two inserts of the same Device. The
-//! `device_message_seq` counter is independent of the messages table, so
-//! pruning never regresses or reuses ids.
+//! rows are deleted under the same store lock (SQLite) or the same
+//! transaction (PostgreSQL); there is no background sweeper. The replay
+//! boundary is still exact: the replay scan (`Store::messages_after`) and
+//! the retained count (`Store::count_messages`) ignore TTL-expired rows
+//! even before the lazy pruning removed them, so an expired message is
+//! never replayed and never counted, and a cap overflow only exists between
+//! two inserts of the same Device. The `device_message_seq` counter is
+//! independent of the messages table, so pruning never regresses or reuses
+//! ids.
 
+mod postgres;
 mod sqlite;
 
+pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
 use std::time::Duration;
@@ -27,6 +33,8 @@ use std::time::Duration;
 pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("postgres error: {0}")]
+    Postgres(#[from] ::postgres::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("store lock poisoned")]
@@ -34,11 +42,19 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// A uniqueness constraint hit (SQLITE_CONSTRAINT_PRIMARYKEY 1555 /
-    /// _UNIQUE 2067) — the mint path retries with fresh randomness.
+    /// A uniqueness constraint hit — the mint path retries with fresh
+    /// randomness. SQLite: SQLITE_CONSTRAINT_PRIMARYKEY 1555 / _UNIQUE 2067;
+    /// PostgreSQL: SQLSTATE 23505 (unique_violation).
     pub fn is_unique_violation(&self) -> bool {
-        matches!(self, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
-            if f.extended_code == 1555 || f.extended_code == 2067)
+        match self {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) => {
+                f.extended_code == 1555 || f.extended_code == 2067
+            }
+            StoreError::Postgres(e) => e
+                .as_db_error()
+                .is_some_and(|db| db.code() == &::postgres::error::SqlState::UNIQUE_VIOLATION),
+            _ => false,
+        }
     }
 }
 

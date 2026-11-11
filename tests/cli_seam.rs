@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{client, free_port, server_header, tls_client, wait_ready};
+use common::{assert_envelope_no_data, client, free_port, server_header, tls_client, wait_ready};
 use serde_json::Value;
 
 fn bin_path() -> &'static Path {
@@ -445,5 +445,88 @@ async fn info_has_upstream_map_shape_via_binary() {
         assert!(body.get(key).is_some(), "/info missing key {key}: {body}");
     }
     assert_eq!(body["devices"], 0);
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL backend selection (ticket 12): `--dsn` / BARK_SERVER_DSN — the
+// deliberate MySQL deviation (ADR-0005: upstream's --dsn activated MySQL).
+// ---------------------------------------------------------------------------
+
+/// Register a device against the spawned server and return its Device Key.
+async fn register_device(base_url: &str, token: &str) -> String {
+    let res = client()
+        .post(format!("{base_url}/register"))
+        .json(&serde_json::json!({"device_token": token, "device_type": "ios"}))
+        .send()
+        .await
+        .expect("register request");
+    assert_eq!(res.status(), 200, "register must succeed: {res:?}");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["code"], 200, "register envelope: {body}");
+    body["data"]["key"]
+        .as_str()
+        .expect("device key")
+        .to_string()
+}
+
+/// `--dsn` pointing at PostgreSQL activates the PG backend and the record
+/// persists across a restart on the same DSN (the env spelling
+/// `BARK_SERVER_DSN` is exercised on the restart leg). Skipped unless the
+/// suite runs in PG parity mode (`BARK_TEST_PG_DSN` — see
+/// tests/common/pg.rs and scripts/test-postgres.sh).
+#[tokio::test]
+async fn dsn_selects_the_postgres_backend() {
+    let Some(dsn) = common::pg::parity_dsn() else {
+        eprintln!("skipping: BARK_TEST_PG_DSN not set (not in PG parity mode)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // Leg 1: the flag spelling.
+    let server = spawn_ready(
+        &[
+            "-addr",
+            &addr,
+            "-data",
+            dir.path().to_str().unwrap(),
+            "--dsn",
+            &dsn,
+        ],
+        &addr,
+    )
+    .await;
+    let key = register_device(&server.base_url, "tokPgDsn").await;
+    drop(server);
+
+    // Leg 2: the env spelling, fresh process on the same DSN — the record
+    // must survive, proving both that the env var selects PG and that the
+    // store behind it is the same PostgreSQL database.
+    let child = tokio::process::Command::new(bin_path())
+        .args(["-addr", &addr, "-data", dir.path().to_str().unwrap()])
+        .env_remove("RUST_LOG")
+        .env("BARK_SERVER_DSN", &dsn)
+        .spawn()
+        .expect("failed to spawn bark-server binary; run `cargo build` first");
+    let server = SpawnedServer {
+        child,
+        base_url: format!("http://{addr}"),
+    };
+    wait_ready(&format!("{}/ping", server.base_url)).await;
+
+    let res = client()
+        .get(format!("{}/register/{key}", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "record must persist across restart: {key}"
+    );
+    let body: Value = res.json().await.unwrap();
+    assert_envelope_no_data(&body, 200, "success");
     drop(server);
 }

@@ -1,7 +1,8 @@
 //! bark-server-rs: a drop-in Rust rewrite of bark-server (ADR-0003) with SSE
 //! realtime mirroring. Single crate; modules per the spec:
 //! `api` (routes/middleware), `events` (bus + fan-out), `mcp` (tool server),
-//! `store` (trait + SQLite impl), `config` (flags/env), `apns` (delivery).
+//! `store` (trait + SQLite default + PostgreSQL backend behind `--dsn`),
+//! `config` (flags/env), `apns` (delivery).
 
 pub mod api;
 pub mod apns;

@@ -35,6 +35,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "json", "rustls"] }
+# PostgreSQL backend (ticket 12, ADR-0005): the sync client from the
+# rust-postgres family — the Store trait is deliberately sync (see
+# store::Store docs), so the PG impl mirrors the SQLite impl's shape
+# (Mutex-guarded short statements) instead of coupling to an async runtime.
+postgres = "0.19.14"
 # Stream combinators for the SSE endpoint's event stream (unfold over the
 # event bus's broadcast receiver); already in the graph via axum.
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }

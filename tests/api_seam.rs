@@ -250,7 +250,10 @@ async fn url_prefix_mounts_all_routes() {
 
 #[tokio::test]
 async fn sqlite_store_file_is_created_under_data_dir() {
-    let (config, dir) = ephemeral_config();
+    let (mut config, dir) = ephemeral_config();
+    // The SQLite file is this test's subject: it pins the default backend
+    // and must not follow PG parity mode (ticket 12).
+    config.dsn = String::new();
     let data_dir = config.data_dir.clone();
     let server = TestServer::spawn(config, dir).await;
 

@@ -31,6 +31,10 @@ fn config_with(data_dir: std::path::PathBuf) -> Config {
     Config {
         addr: format!("127.0.0.1:{}", common::free_port()),
         data_dir,
+        // Backend parity (ticket 12): restart tests exercise the parity
+        // backend in PG mode (one database per test thread, so both server
+        // legs share it), the SQLite default otherwise.
+        dsn: common::pg::parity_dsn_per_test().unwrap_or_default(),
         ..Default::default()
     }
 }
