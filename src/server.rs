@@ -75,7 +75,13 @@ pub async fn run_server(
     // Upstream: initializeDatabase before startServer (ReCreateAPNS runs in
     // upstream's init(); the client is built here from the config instead,
     // which is equivalent since no connection is made until a push).
-    let store = SqliteStore::open(&config.data_dir)
+    // Retention (ticket 08, ADR-0002): the additive flags are seconds/count
+    // with 0 = limit disabled (MessageRetention::from_limits).
+    let retention = crate::store::MessageRetention::from_limits(
+        config.sse_message_ttl_secs,
+        config.sse_message_cap,
+    );
+    let store = SqliteStore::open(&config.data_dir, retention)
         .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?;
     let store: Arc<dyn Store> = Arc::new(store);
     let apns = ApnsClient::from_config(&config).context("failed to initialize APNs client")?;

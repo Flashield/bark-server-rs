@@ -9,17 +9,22 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::{
-    DeviceRecord, MessageRecord, NewMessage, RevokeOutcome, Store, StoreError, StreamTokenRecord,
+    DeviceRecord, MessageRecord, MessageRetention, NewMessage, RevokeOutcome, Store, StoreError,
+    StreamTokenRecord,
 };
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    /// Per-Device retention policy (ticket 08): applied lazily at insert
+    /// time and in the replay/count scans; see `MessageRetention`.
+    retention: MessageRetention,
 }
 
 impl SqliteStore {
     /// Open (creating if needed) the SQLite file under `data_dir`. The data
     /// directory is created if missing, like upstream's `MkdirAll(0755)`.
-    pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+    /// `retention` bounds the per-Device message store (ticket 08).
+    pub fn open(data_dir: &Path, retention: MessageRetention) -> Result<Self, StoreError> {
         std::fs::create_dir_all(data_dir)?;
         let conn = Connection::open(data_dir.join("bark.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -67,6 +72,7 @@ impl SqliteStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            retention,
         })
     }
 }
@@ -87,7 +93,17 @@ impl Store for SqliteStore {
 
     fn count_messages(&self) -> Result<i64, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
-        Ok(conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?)
+        // Retention-aware (ticket 08): pending_messages counts what replay
+        // could return, so TTL-expired rows never count — even before the
+        // lazy insert-time pruning removed them (MessageRetention docs).
+        match self.retention.ttl_cutoff_at(crate::api::now_unix()) {
+            None => Ok(conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?),
+            Some(cutoff) => Ok(conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE created_at >= ?1",
+                rusqlite::params![cutoff],
+                |row| row.get(0),
+            )?),
+        }
     }
 
     fn insert_message(&self, message: &NewMessage) -> Result<MessageRecord, StoreError> {
@@ -119,6 +135,28 @@ impl Store for SqliteStore {
                 created_at,
             ],
         )?;
+        // Lazy retention pruning (ticket 08, MessageRetention docs): the
+        // inserting Device's TTL-expired and over-cap rows are deleted right
+        // here, under the connection mutex — no background sweeper. The
+        // fresh row is inserted first, so it is always the newest and can
+        // never prune itself.
+        if let Some(cutoff) = self.retention.ttl_cutoff_at(created_at) {
+            conn.execute(
+                "DELETE FROM messages WHERE device_key = ?1 AND created_at < ?2",
+                rusqlite::params![message.device_key, cutoff],
+            )?;
+        }
+        if let Some(cap) = self.retention.cap {
+            // Keep the newest `cap` rows by id (id order is age order); drop
+            // the rest of this Device's history.
+            conn.execute(
+                "DELETE FROM messages WHERE device_key = ?1 AND id NOT IN (
+                     SELECT id FROM messages WHERE device_key = ?1
+                     ORDER BY id DESC LIMIT ?2
+                 )",
+                rusqlite::params![message.device_key, cap],
+            )?;
+        }
         Ok(MessageRecord {
             device_key: message.device_key.clone(),
             id,
@@ -128,6 +166,40 @@ impl Store for SqliteStore {
             ext_params: message.ext_params.clone(),
             created_at,
         })
+    }
+
+    fn messages_after(
+        &self,
+        device_key: &str,
+        after_id: i64,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        // The PRIMARY KEY (device_key, id) index serves this scan directly;
+        // ORDER BY id is the replay contract (ascending per-device order).
+        // TTL-expired rows are invisible to the replay boundary even before
+        // the lazy insert-time pruning removed them (MessageRetention docs).
+        let cutoff = self.retention.ttl_cutoff_at(crate::api::now_unix());
+        let sql = match cutoff {
+            None => {
+                "SELECT device_key, id, title, subtitle, body, ext_params, created_at
+                 FROM messages WHERE device_key = ?1 AND id > ?2 ORDER BY id"
+            }
+            Some(_) => {
+                "SELECT device_key, id, title, subtitle, body, ext_params, created_at
+                 FROM messages WHERE device_key = ?1 AND id > ?2 AND created_at >= ?3
+                 ORDER BY id"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match cutoff {
+            None => stmt
+                .query_map(rusqlite::params![device_key, after_id], map_message)?
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(cutoff) => stmt
+                .query_map(rusqlite::params![device_key, after_id, cutoff], map_message)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
     }
 
     fn save_device_token_by_key(
@@ -291,5 +363,18 @@ fn map_stream_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamTokenReco
         client_label: row.get(3)?,
         created_at: row.get(4)?,
         revoked: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+/// Row mapper for the message-store queries (replay scan, ticket 08).
+fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        device_key: row.get(0)?,
+        id: row.get(1)?,
+        title: row.get(2)?,
+        subtitle: row.get(3)?,
+        body: row.get(4)?,
+        ext_params: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }

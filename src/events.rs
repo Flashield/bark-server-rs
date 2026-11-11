@@ -10,8 +10,11 @@
 //! One broadcast channel per Device Key (created lazily, kept for the
 //! process lifetime — one entry per Device ever streamed to), each carrying
 //! `Arc<PushEvent>` values. Every subscriber gets the events published after
-//! its subscription: live delivery only. Replay of missed messages is
-//! ticket 08's store-backed half of ADR-0002; this bus is the live half.
+//! its subscription: live delivery only. The store-backed replay half of
+//! ADR-0002 (ticket 08) lives here too: [`EventBus::subscribe_with_replay`]
+//! registers the subscription AND collects the retained-message replay
+//! window under the Device's publish lock, so replay and live delivery tile
+//! without gap or overlap.
 //!
 //! # Per-device FIFO ordering
 //!
@@ -63,7 +66,7 @@ pub struct PushEvent {
 }
 
 impl PushEvent {
-    fn from_record(record: &MessageRecord, ext_params: Map<String, Value>) -> Self {
+    pub(crate) fn from_record(record: &MessageRecord, ext_params: Map<String, Value>) -> Self {
         Self {
             id: record.id,
             title: record.title.clone(),
@@ -145,11 +148,51 @@ impl EventBus {
         Ok(record)
     }
 
-    /// Subscribe to a Device's live push events (the SSE stream's receiver;
-    /// the future WS endpoint's too). Events published before this call are
-    /// not delivered — replay is ticket 08's job.
+    /// Subscribe to a Device's live push events. Events published before
+    /// this call are not delivered — combine with
+    /// [`EventBus::subscribe_with_replay`] when the caller needs the
+    /// store-and-forward contract (ADR-0002).
     pub fn subscribe(&self, device_key: &str) -> broadcast::Receiver<Arc<PushEvent>> {
         self.channel(device_key).sender.subscribe()
+    }
+
+    /// Subscribe to a Device's live pushes AND collect its stored messages
+    /// after `after_id` — the replay+live handoff of ADR-0002 (ticket 08,
+    /// [`crate::api::sse`]).
+    ///
+    /// Both steps run under the Device's publish lock — the same lock the
+    /// publish path holds across (assign id → persist → broadcast) — so a
+    /// push either completes entirely before this call takes the lock (its
+    /// row is in the returned replay list, and its broadcast happened before
+    /// the receiver was created) or starts entirely after the lock is
+    /// released (its row is invisible to the replay scan and its broadcast
+    /// lands on the receiver). Replayed and live events therefore tile
+    /// exactly, in monotonic id order: no gap, no duplicate. This is ticket
+    /// 07's deterministic handshake race, extended over the replay window.
+    ///
+    /// `after_id = None` skips the store scan entirely (fresh subscription).
+    pub async fn subscribe_with_replay(
+        &self,
+        device_key: &str,
+        after_id: Option<i64>,
+    ) -> Result<(Vec<Arc<PushEvent>>, broadcast::Receiver<Arc<PushEvent>>), StoreError> {
+        let channel = self.channel(device_key);
+        let _guard = channel.lock.lock().await;
+        let receiver = channel.sender.subscribe();
+        let replay = match after_id {
+            None => Vec::new(),
+            Some(after_id) => self
+                .store
+                .messages_after(device_key, after_id)?
+                .into_iter()
+                .map(|record| {
+                    let ext_params: Map<String, Value> = serde_json::from_str(&record.ext_params)
+                        .expect("stored ext params are valid JSON");
+                    Arc::new(PushEvent::from_record(&record, ext_params))
+                })
+                .collect(),
+        };
+        Ok((replay, receiver))
     }
 
     /// Live Realtime Streams across all Devices — the sum of current
