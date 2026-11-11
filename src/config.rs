@@ -122,6 +122,14 @@ pub struct Config {
     /// seconds between SSE keepalive comment lines on the realtime stream,
     /// keeping proxies/NATs from idling the connection out; 0 disables)
     pub sse_keepalive_secs: u64,
+    /// `--sse-message-ttl-secs` / `BARK_SERVER_SSE_MESSAGE_TTL_SECS`
+    /// (additive; per-Device retention TTL of the realtime replay store in
+    /// seconds, 0 disables TTL pruning; default 259200 = 72h, ADR-0002)
+    pub sse_message_ttl_secs: u64,
+    /// `--sse-message-cap` / `BARK_SERVER_SSE_MESSAGE_CAP` (additive;
+    /// maximum retained messages per Device for the realtime replay store,
+    /// oldest dropped beyond it, 0 disables the cap; default 1000, ADR-0002)
+    pub sse_message_cap: u64,
     /// MCP session idle TTL (additive, hidden; upstream hardcodes
     /// `mcpSessionIdleTTL` at 10 minutes, see route_mcp.go — the knob exists
     /// so the expiry behavior is drivable over the test seam)
@@ -152,6 +160,8 @@ impl Default for Config {
             apns_endpoint: "https://api.push.apple.com".into(),
             apns_insecure_skip_tls_verify: false,
             sse_keepalive_secs: 15,
+            sse_message_ttl_secs: 72 * 60 * 60,
+            sse_message_cap: 1000,
             mcp_session_idle_ttl: crate::mcp::SESSION_IDLE_TTL,
         }
     }
@@ -299,6 +309,19 @@ pub struct Cli {
     #[arg(long, env = "BARK_SERVER_SSE_KEEPALIVE_SECS", default_value = "15")]
     pub sse_keepalive_secs: u64,
 
+    /// Seconds a Push stays in the per-Device replay store (additive; 0
+    /// disables TTL pruning)
+    #[arg(
+        long,
+        env = "BARK_SERVER_SSE_MESSAGE_TTL_SECS",
+        default_value = "259200"
+    )]
+    pub sse_message_ttl_secs: u64,
+
+    /// Maximum retained Pushes per Device, oldest dropped first (additive;
+    /// 0 disables the cap)
+    #[arg(long, env = "BARK_SERVER_SSE_MESSAGE_CAP", default_value = "1000")]
+    pub sse_message_cap: u64,
     /// Idle TTL after which MCP sessions are closed (additive, hidden;
     /// upstream hardcodes 10 minutes in route_mcp.go)
     #[arg(
@@ -334,6 +357,8 @@ const LONG_FLAGS: &[&str] = &[
     "apns-endpoint",
     "apns-insecure-skip-tls-verify",
     "sse-keepalive-secs",
+    "sse-message-ttl-secs",
+    "sse-message-cap",
     "mcp-session-idle-ttl",
     "help",
     "version",
@@ -399,6 +424,8 @@ impl Cli {
             apns_endpoint: self.apns_endpoint.clone(),
             apns_insecure_skip_tls_verify: self.apns_insecure_skip_tls_verify,
             sse_keepalive_secs: self.sse_keepalive_secs,
+            sse_message_ttl_secs: self.sse_message_ttl_secs,
+            sse_message_cap: self.sse_message_cap,
             mcp_session_idle_ttl: self.mcp_session_idle_ttl.0,
         }
     }

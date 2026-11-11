@@ -11,7 +11,10 @@ mod common;
 use std::time::Duration;
 
 use common::apns_stub::ApnsStub;
-use common::{TestServer, assert_envelope_no_data, client, ephemeral_config, server_header};
+use common::sse_client::{
+    SseStream, assert_connected, assert_event_shape, assert_keepalive, stream_client,
+};
+use common::{TestServer, assert_envelope_no_data, client, ephemeral_config};
 use serde_json::{Value, json};
 
 /// Spawn a bark server with a 1s SSE keepalive (fast observable keepalives)
@@ -65,6 +68,8 @@ async fn info(server: &TestServer) -> Value {
 
 // ---------------------------------------------------------------------------
 // SSE plumbing: minting tokens and reading raw SSE frames over the boundary
+// (the frame machinery lives in common/sse_client.rs, shared with the
+// replay suite)
 // ---------------------------------------------------------------------------
 
 /// Mint a Stream Token for `device_key` and return the full secret.
@@ -79,195 +84,6 @@ async fn mint_token(server: &TestServer, device_key: &str) -> String {
     assert_eq!(res.status(), 200, "mint must succeed");
     let env: Value = res.json().await.unwrap();
     env["data"]["token"].as_str().expect("token").to_string()
-}
-
-/// An SSE-capable client: no total-request timeout (the stream is long-lived).
-fn stream_client() -> reqwest::Client {
-    reqwest::Client::builder().build().expect("stream client")
-}
-
-/// One parsed SSE frame (fields of a "block" terminated by a blank line).
-#[derive(Debug, Default, PartialEq)]
-struct SseFrame {
-    comment: Option<String>,
-    event: Option<String>,
-    id: Option<String>,
-    data: Vec<String>,
-}
-
-impl SseFrame {
-    /// The data payload re-joined (single-line data → itself).
-    fn data_text(&self) -> String {
-        self.data.join("\n")
-    }
-}
-
-/// Parse every complete frame out of a raw byte buffer, returning the frames
-/// and the leftover partial bytes.
-fn parse_frames(buf: &[u8]) -> (Vec<SseFrame>, Vec<u8>) {
-    let text = String::from_utf8_lossy(buf).into_owned();
-    let mut frames = Vec::new();
-    let mut rest = &text[..];
-    while let Some(pos) = rest.find("\n\n") {
-        let (frame_text, tail) = rest.split_at(pos);
-        let mut frame = SseFrame::default();
-        for line in frame_text.split('\n') {
-            if let Some(comment) = line.strip_prefix(':') {
-                // SSE convention: one optional space after the colon is not
-                // part of the value (axum writes ": connected").
-                let value = comment.strip_prefix(' ').unwrap_or(comment);
-                frame.comment = Some(value.to_string());
-            } else if let Some(value) = line.strip_prefix("event: ") {
-                frame.event = Some(value.to_string());
-            } else if let Some(value) = line.strip_prefix("id: ") {
-                frame.id = Some(value.to_string());
-            } else if let Some(value) = line.strip_prefix("data: ") {
-                frame.data.push(value.to_string());
-            } else if line == "data:" {
-                frame.data.push(String::new());
-            }
-        }
-        frames.push(frame);
-        rest = &tail[2..];
-    }
-    (frames, rest.as_bytes().to_vec())
-}
-
-/// A connected SSE stream: the raw response plus a byte buffer.
-struct SseStream {
-    res: reqwest::Response,
-    buf: Vec<u8>,
-    done: bool,
-}
-
-impl SseStream {
-    /// Open the stream with `X-Stream-Token` auth and assert the response
-    /// contract (status, headers) before returning it.
-    async fn open(server: &TestServer, token: &str) -> Self {
-        let res = stream_client()
-            .get(server.url("/realtime/v1/stream"))
-            .header("X-Stream-Token", token)
-            .send()
-            .await
-            .expect("stream connect");
-        assert_eq!(res.status(), 200, "valid token connects");
-        assert_eq!(server_header(&res), "Bark", "SSE keeps the Bark header");
-        let content_type = res
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .expect("content-type")
-            .to_string();
-        assert!(
-            content_type.starts_with("text/event-stream"),
-            "SSE content type, got {content_type:?}"
-        );
-        assert_eq!(
-            res.headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok()),
-            Some("no-cache"),
-            "SSE must not be cached"
-        );
-        Self {
-            res,
-            buf: Vec::new(),
-            done: false,
-        }
-    }
-
-    /// Read frames until at least `count` are collected or the deadline
-    /// passes (panics on timeout — tests must not hang).
-    async fn read_frames(&mut self, count: usize, timeout: Duration) -> Vec<SseFrame> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut frames = Vec::new();
-        while frames.len() < count {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "timed out waiting for {count} frames; have {}: {frames:?}",
-                    frames.len()
-                );
-            }
-            if self.done {
-                panic!("stream ended after {frames:?} frames while waiting for {count}");
-            }
-            match tokio::time::timeout(remaining, self.res.chunk()).await {
-                Err(_) => panic!("read deadline hit waiting for {count} frames; have {frames:?}"),
-                Ok(Err(e)) => panic!("stream read error: {e}"),
-                Ok(Ok(None)) => self.done = true,
-                Ok(Ok(Some(bytes))) => self.buf.extend_from_slice(&bytes),
-            }
-            let (mut parsed, rest) = parse_frames(&self.buf);
-            self.buf = rest;
-            frames.append(&mut parsed);
-        }
-        frames
-    }
-
-    /// Whatever frames arrive within `timeout` — never panics on timeout.
-    async fn try_read_frames(&mut self, timeout: Duration) -> Vec<SseFrame> {
-        let mut frames = Vec::new();
-        let _ = tokio::time::timeout(timeout, async {
-            loop {
-                if self.done {
-                    return;
-                }
-                match self.res.chunk().await {
-                    Err(_) | Ok(None) => {
-                        self.done = true;
-                        return;
-                    }
-                    Ok(Some(bytes)) => self.buf.extend_from_slice(&bytes),
-                }
-                let (mut parsed, rest) = parse_frames(&self.buf);
-                self.buf = rest;
-                frames.append(&mut parsed);
-            }
-        })
-        .await;
-        frames
-    }
-
-    /// The first `event: message` frame with its data parsed as JSON.
-    async fn next_push_event(&mut self) -> (SseFrame, Value) {
-        loop {
-            let frames = self.read_frames(1, Duration::from_secs(10)).await;
-            for frame in frames {
-                if frame.event.as_deref() == Some("message") {
-                    let data: Value =
-                        serde_json::from_str(&frame.data_text()).expect("event data is JSON");
-                    return (frame, data);
-                }
-            }
-        }
-    }
-}
-
-/// Assert the frame is the server's connected handshake comment.
-fn assert_connected(frame: &SseFrame) {
-    assert_eq!(
-        frame.comment.as_deref(),
-        Some("connected"),
-        "first frame is the : connected comment: {frame:?}"
-    );
-    assert!(
-        frame.data.is_empty() && frame.event.is_none() && frame.id.is_none(),
-        "handshake carries no event fields: {frame:?}"
-    );
-}
-
-/// Assert the frame is a keepalive comment (no event fields).
-fn assert_keepalive(frame: &SseFrame) {
-    assert_eq!(
-        frame.comment.as_deref(),
-        Some("keep-alive"),
-        "keepalive is a comment line: {frame:?}"
-    );
-    assert!(
-        frame.data.is_empty() && frame.event.is_none() && frame.id.is_none(),
-        "keepalive carries no event fields: {frame:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -601,32 +417,6 @@ async fn basic_auth_applies_to_stream_endpoint() {
 // Live fan-out: pushes reach every connected stream of the Device
 // ---------------------------------------------------------------------------
 
-/// Assert the event JSON carries exactly the full-Push fields.
-fn assert_event_shape(data: &Value, device_key: &str) {
-    let obj = data.as_object().expect("event data is a JSON object");
-    let mut fields: Vec<&String> = obj.keys().collect();
-    fields.sort();
-    assert_eq!(
-        fields,
-        [
-            "body",
-            "created_at",
-            "device_key",
-            "ext_params",
-            "id",
-            "subtitle",
-            "title",
-        ],
-        "event data must carry exactly the full Push: {data}"
-    );
-    assert_eq!(data["device_key"], device_key);
-    assert!(data["id"].is_i64(), "monotonic id is an integer: {data}");
-    assert!(
-        data["created_at"].is_i64(),
-        "created_at is an integer: {data}"
-    );
-}
-
 #[tokio::test]
 async fn pushes_fan_out_with_monotonic_ids_and_full_shape() {
     let stub = ApnsStub::spawn().await;
@@ -846,9 +636,10 @@ async fn streams_are_isolated_per_device() {
 
 #[tokio::test]
 async fn late_stream_gets_only_new_events() {
-    // No replay in this ticket (ADR-0002's replay half is ticket 08): a
-    // stream opened after pushes sees only pushes from the handshake on,
-    // and the monotonic ids continue — proving the store counts every push.
+    // Absent Last-Event-ID means a fresh subscription: a stream opened after
+    // pushes sees only pushes from the handshake on, and the monotonic ids
+    // continue — proving the store counts every push. (Replay with an
+    // explicit Last-Event-ID is the replay suite's subject.)
     let stub = ApnsStub::spawn().await;
     let server = spawn(&stub).await;
     let key = register_device(&server, "", "stream").await;
