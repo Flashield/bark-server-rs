@@ -111,8 +111,13 @@ pub async fn push_post(State(state): State<AppState>, req: Request) -> Response 
 }
 
 /// Upstream `push(params)`: collect a [`PushMessage`], resolve the Device,
-/// deliver, and map the outcome onto `(status, message)`.
-async fn push_core(state: &AppState, params: Map<String, Value>) -> Result<(), (u16, String)> {
+/// deliver, and map the outcome onto `(status, message)`. Shared by the HTTP
+/// push routes and the MCP `notify` tool (crate-visible: `src/mcp.rs` routes
+/// through the exact same core).
+pub(crate) async fn push_core(
+    state: &AppState,
+    params: Map<String, Value>,
+) -> Result<(), (u16, String)> {
     // Default value: empty body, default sound "1107".
     let mut msg = PushMessage {
         id: String::new(),

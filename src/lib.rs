@@ -7,6 +7,7 @@
 pub mod api;
 pub mod apns;
 pub mod config;
+pub mod mcp;
 pub mod random;
 pub mod server;
 pub mod shortuuid;
