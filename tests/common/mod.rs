@@ -7,6 +7,7 @@
 #![allow(dead_code)] // helpers are shared per test-target, not all used everywhere
 
 pub mod apns_stub;
+pub mod pg;
 pub mod sse_client;
 
 use std::time::Duration;
@@ -80,11 +81,15 @@ impl TestServer {
 /// A config whose data dir and port are ephemeral, plus its temp dir handle.
 pub fn ephemeral_config() -> (Config, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let config = Config {
+    let mut config = Config {
         addr: format!("127.0.0.1:{}", free_port()),
         data_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
+    // Backend parity (ticket 12): in PG parity mode the same suites, with
+    // untouched assertions, run against a fresh PostgreSQL database; absent
+    // the parity env the default SQLite backend is used.
+    config.dsn = pg::parity_dsn().unwrap_or_default();
     (config, dir)
 }
 
@@ -92,7 +97,14 @@ pub fn ephemeral_config() -> (Config, tempfile::TempDir) {
 /// with a success status.
 pub async fn wait_ready(probe_url: &str) {
     let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // PG parity mode (ticket 12) adds per-spawn provisioning + connect +
+    // schema migration work on a possibly loaded machine; give it headroom.
+    let budget = if std::env::var_os("BARK_TEST_PG_DSN").is_some() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(15)
+    };
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
         if tokio::time::Instant::now() >= deadline {
             panic!("server at {probe_url} did not become ready in time");

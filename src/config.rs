@@ -1,9 +1,12 @@
 //! Configuration surface: the full upstream bark-server v2.4.0 flag/env table
 //! (audited from upstream `main.go`), plus the additive APNs endpoint knob.
 //!
-//! Upstream flags that belong to deliberately dropped backends (MySQL
-//! `--dsn`/`--mysql-*`, `--serverless`) are not accepted; see ADR-0005 and the
-//! spec's Out of Scope section.
+//! Backend selection deviates from upstream deliberately (ADR-0005,
+//! ticket 12): upstream's `--dsn` activated its **MySQL** backend; here
+//! `--dsn` / `BARK_SERVER_DSN` activates **PostgreSQL**, and an absent DSN
+//! means the embedded SQLite default. Upstream's remaining MySQL flags
+//! (`--mysql-tls-*`) and the serverless-env backend stay dropped (spec,
+//! Out of Scope). See `src/store/postgres.rs` for the full deviation list.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -80,6 +83,13 @@ pub struct Config {
     pub url_prefix: String,
     /// `--data` / `BARK_SERVER_DATA_DIR`
     pub data_dir: PathBuf,
+    /// `--dsn` / `BARK_SERVER_DSN` (empty = SQLite default). A libpq
+    /// connection string — URL (`postgres://user:pass@host:port/db`) or
+    /// keyword/value — selecting the PostgreSQL backend (ticket 12,
+    /// ADR-0005). The deliberate MySQL deviation: upstream's `--dsn`
+    /// activated MySQL; ours activates PostgreSQL, and an absent DSN keeps
+    /// the embedded SQLite default (never MySQL).
+    pub dsn: String,
     /// `--cert` / `BARK_SERVER_CERT` (with `--key`, enables TLS)
     pub cert: String,
     /// `--key` / `BARK_SERVER_KEY`
@@ -143,6 +153,7 @@ impl Default for Config {
             unix_socket: String::new(),
             url_prefix: "/".into(),
             data_dir: PathBuf::from("/data"),
+            dsn: String::new(),
             cert: String::new(),
             key: String::new(),
             case_sensitive: false,
@@ -190,6 +201,13 @@ pub struct Cli {
     /// Server data storage dir
     #[arg(long, env = "BARK_SERVER_DATA_DIR", default_value = "/data")]
     pub data: String,
+
+    /// PostgreSQL connection string (libpq URL or keyword/value) selecting
+    /// the PostgreSQL backend; empty keeps the embedded SQLite default.
+    /// Deliberate deviation from upstream, whose --dsn activated MySQL
+    /// (ADR-0005, ticket 12)
+    #[arg(long, env = "BARK_SERVER_DSN", default_value = "")]
+    pub dsn: String,
 
     /// Server TLS certificate
     #[arg(long, env = "BARK_SERVER_CERT", default_value = "")]
@@ -340,6 +358,7 @@ const LONG_FLAGS: &[&str] = &[
     "unix-socket",
     "url-prefix",
     "data",
+    "dsn",
     "cert",
     "key",
     "case-sensitive",
@@ -407,6 +426,7 @@ impl Cli {
             unix_socket: self.unix_socket.clone(),
             url_prefix: self.url_prefix.clone(),
             data_dir: PathBuf::from(&self.data),
+            dsn: self.dsn.clone(),
             cert: self.cert.clone(),
             key: self.key.clone(),
             case_sensitive: self.case_sensitive,
