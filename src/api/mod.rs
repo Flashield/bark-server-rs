@@ -97,6 +97,16 @@ pub fn error_envelope(status: StatusCode, message: impl Into<String>) -> Respons
 #[derive(Clone, Debug)]
 pub struct OriginalPath(pub String);
 
+/// The raw path segments of the original request (after the url prefix),
+/// captured by [`AppService`] for the compat routes (see [`push`]). Fiber
+/// slices route params from the raw path — no percent-decoding, original
+/// casing — while matching on the lowercased detection path; axum's `Path`
+/// extractor percent-decodes, so the compat handlers read these instead.
+/// Trailing-slash remnants (empty final segments) are popped to match
+/// fiber's detection-path trailing-slash trim.
+#[derive(Clone, Debug)]
+pub struct CompatSegments(pub Vec<String>);
+
 /// Go `html.EscapeString` — fiber HTML-escapes the path in 404 messages.
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -156,16 +166,6 @@ where
     post(post_handler)
         .get(get_handler)
         .fallback(method_not_allowed)
-}
-
-/// `post(...)` with a fiber-compatible 405 fallback for other methods
-/// (upstream registers only POST on `/push`).
-fn post_route<H, T>(handler: H) -> MethodRouter<AppState>
-where
-    H: axum::handler::Handler<T, AppState>,
-    T: 'static,
-{
-    post(handler).fallback(method_not_allowed)
 }
 
 /// `delete(...)` with a fiber-compatible 405 fallback for other methods.
@@ -258,6 +258,9 @@ pub struct AppService<S> {
     case_sensitive: bool,
     strict_routing: bool,
     auth: Option<auth::BasicAuth>,
+    /// Normalized url prefix, used to strip the prefix from the raw segments
+    /// captured for the compat routes.
+    prefix: String,
 }
 
 impl<S> AppService<S> {
@@ -266,12 +269,14 @@ impl<S> AppService<S> {
         case_sensitive: bool,
         strict_routing: bool,
         auth: Option<auth::BasicAuth>,
+        url_prefix: &str,
     ) -> Self {
         Self {
             inner,
             case_sensitive,
             strict_routing,
             auth,
+            prefix: normalized_prefix(url_prefix),
         }
     }
 }
@@ -296,6 +301,20 @@ where
     fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
         let path = req.uri().path().to_string();
         req.extensions_mut().insert(OriginalPath(path.clone()));
+
+        // Raw segments (after the url prefix) for the compat routes: fiber
+        // slices param values from the raw path, keeping both percent-escapes
+        // and the original casing.
+        let after_prefix = path.strip_prefix(&self.prefix).unwrap_or(&path).to_string();
+        let mut segments: Vec<String> = after_prefix
+            .split('/')
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        while segments.last().is_some_and(String::is_empty) {
+            segments.pop();
+        }
+        req.extensions_mut().insert(CompatSegments(segments));
 
         let detection_path = detection_path_for(&path, self.case_sensitive, self.strict_routing);
 
@@ -363,6 +382,14 @@ where
 
 /// Assemble the application: routes (optionally nested under the url prefix)
 /// wrapped in [`AppService`].
+///
+/// Route mount parity with upstream (router.go weight ordering, verified
+/// against the Go server): `register_compat` (weight 100) mounts first, the
+/// canonical routes (weight 50) next, and the parametric compat push routes
+/// (`push_compat`, weight 1) last. Fiber matches in registration order, so
+/// the compat mounts only see paths the canonical routes missed; axum's
+/// matchit gives static segments precedence over parameters natively, and
+/// the method-level fallbacks reproduce fiber's 405-on-existing-path.
 pub fn build_app_service(state: &AppState) -> AppService<Router> {
     let inner = Router::new()
         .route("/", get_route(misc::root))
@@ -375,9 +402,15 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
         )
         .route(
             "/register/{device_key}",
-            get_route(register::register_check),
+            // Canonical GET check; POST falls through to the compat push
+            // (upstream: GET /register/:device_key is registered before the
+            // compat routes, but the compat POST /:device_key/:body catches
+            // the method the canonical route does not handle).
+            get(register::register_check)
+                .post(push::compat_2)
+                .fallback(method_not_allowed),
         )
-        .route("/push", post_route(push::push_post))
+        .route("/push", post_get_route(push::push_post, push::compat_1))
         // MCP tool server: generic endpoint (device_key as tool argument) and
         // the path-bound one (device_key injected over the args). All HTTP
         // methods, like upstream fiber's router.All; src/mcp.rs holds the
@@ -398,6 +431,36 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
         // The SSE realtime stream: Stream Token auth, live push mirror
         // (api/sse.rs holds the contract).
         .route("/realtime/v1/stream", get_route(sse::stream_connect))
+        // Legacy compat push routes (upstream `push_compat`, weight 1):
+        // GET/POST on 1-4 segment paths, mounted after every canonical
+        // route. `GET /push` resolves here upstream (the canonical /push is
+        // POST-only), which is why the static route above chains compat_1
+        // as its GET handler. Static segments (/mcp, /realtime/v1/stream)
+        // outrank these parameters natively in matchit.
+        .route(
+            "/{device_key}",
+            get(push::compat_1)
+                .post(push::compat_1)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/{device_key}/{body}",
+            get(push::compat_2)
+                .post(push::compat_2)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/{device_key}/{title}/{body}",
+            get(push::compat_3)
+                .post(push::compat_3)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/{device_key}/{title}/{subtitle}/{body}",
+            get(push::compat_4)
+                .post(push::compat_4)
+                .fallback(method_not_allowed),
+        )
         .fallback(not_found)
         .with_state(state.clone());
 
@@ -420,5 +483,6 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             &state.config.basic_auth_user,
             &state.config.basic_auth_password,
         ),
+        &state.config.url_prefix,
     )
 }

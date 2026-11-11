@@ -1,0 +1,8 @@
+# Keep the build context small and the build deterministic.
+.git
+target
+data
+docs
+deploy/data
+**/*.md
+!README.md

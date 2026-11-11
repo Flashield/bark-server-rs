@@ -1,0 +1,21 @@
+# Upstream-style compose sample: build the image from the repo root and run
+# it with the SQLite store persisted to ./data.
+#
+#   docker compose up -d --build
+#
+# The container runs as uid/gid 1000 (non-root). When ./data already exists,
+# make it writable for that user (e.g. `mkdir -p data && chown 1000:1000 data`);
+# when it does not, Docker creates it root-owned — pass `user: "0:0"` as an
+# override, or pre-create the directory.
+services:
+  bark-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: bark-server-rs:latest
+    container_name: bark-server
+    restart: always
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"
