@@ -122,6 +122,10 @@ pub struct Config {
     /// seconds between SSE keepalive comment lines on the realtime stream,
     /// keeping proxies/NATs from idling the connection out; 0 disables)
     pub sse_keepalive_secs: u64,
+    /// MCP session idle TTL (additive, hidden; upstream hardcodes
+    /// `mcpSessionIdleTTL` at 10 minutes, see route_mcp.go — the knob exists
+    /// so the expiry behavior is drivable over the test seam)
+    pub mcp_session_idle_ttl: Duration,
 }
 
 impl Default for Config {
@@ -148,6 +152,7 @@ impl Default for Config {
             apns_endpoint: "https://api.push.apple.com".into(),
             apns_insecure_skip_tls_verify: false,
             sse_keepalive_secs: 15,
+            mcp_session_idle_ttl: crate::mcp::SESSION_IDLE_TTL,
         }
     }
 }
@@ -293,6 +298,16 @@ pub struct Cli {
     /// (additive; 0 disables keepalives)
     #[arg(long, env = "BARK_SERVER_SSE_KEEPALIVE_SECS", default_value = "15")]
     pub sse_keepalive_secs: u64,
+
+    /// Idle TTL after which MCP sessions are closed (additive, hidden;
+    /// upstream hardcodes 10 minutes in route_mcp.go)
+    #[arg(
+        long,
+        env = "BARK_SERVER_MCP_SESSION_IDLE_TTL",
+        default_value = "10m",
+        hide = true
+    )]
+    pub mcp_session_idle_ttl: GoDuration,
 }
 
 /// Every long flag name the CLI defines (plus the auto-generated ones), used
@@ -319,6 +334,7 @@ const LONG_FLAGS: &[&str] = &[
     "apns-endpoint",
     "apns-insecure-skip-tls-verify",
     "sse-keepalive-secs",
+    "mcp-session-idle-ttl",
     "help",
     "version",
 ];
@@ -383,6 +399,7 @@ impl Cli {
             apns_endpoint: self.apns_endpoint.clone(),
             apns_insecure_skip_tls_verify: self.apns_insecure_skip_tls_verify,
             sse_keepalive_secs: self.sse_keepalive_secs,
+            mcp_session_idle_ttl: self.mcp_session_idle_ttl.0,
         }
     }
 }
