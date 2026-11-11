@@ -11,7 +11,7 @@
 //!
 //! Basic Auth (see [`auth`]) also runs in [`AppService`], in front of every
 //! route including the fallbacks, exactly like upstream's fiber middleware —
-//! so later MCP/SSE routes inherit it automatically.
+//! so the MCP (`src/mcp.rs`) and SSE routes inherit it automatically.
 //!
 //! The normalization runs in [`AppService`], which wraps the whole `Router`:
 //! `Router::layer` middleware would run *after* routing (see axum's
@@ -31,10 +31,11 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{MethodRouter, delete, get, post};
+use axum::routing::{MethodRouter, any, delete, get, post};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 
+use crate::mcp;
 use crate::server::AppState;
 
 /// Upstream `CommonResp` (router.go): `{code, message, data?, timestamp}`.
@@ -176,6 +177,17 @@ where
     delete(handler).fallback(method_not_allowed)
 }
 
+/// `any(...)` — upstream fiber `router.All`: the MCP endpoints are
+/// registered for every HTTP method (the handler dispatches on the method
+/// itself, mirroring net/http's ServeHTTP switch).
+fn any_route<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    any(handler)
+}
+
 pub fn normalized_prefix(url_prefix: &str) -> String {
     let trimmed = url_prefix.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -197,6 +209,8 @@ const STATIC_SEGMENTS: &[&str] = &[
     // endpoint (api/sse.rs); like the upstream route names, these match
     // case-insensitively under fiber's default config.
     "realtime", "v1", "devices", "streams", "stream",
+    // MCP tool server (src/mcp.rs); upstream registers it with router.All.
+    "mcp",
 ];
 
 /// Fiber-compatible path normalization: trim all trailing slashes unless
@@ -364,6 +378,12 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             get_route(register::register_check),
         )
         .route("/push", post_route(push::push_post))
+        // MCP tool server: generic endpoint (device_key as tool argument) and
+        // the path-bound one (device_key injected over the args). All HTTP
+        // methods, like upstream fiber's router.All; src/mcp.rs holds the
+        // contract.
+        .route("/mcp", any_route(mcp::generic))
+        .route("/mcp/{device_key}", any_route(mcp::specific))
         // Realtime credential plane: mint (POST) + list (GET) a Device's
         // Stream Tokens, revoke one by id (DELETE). api/realtime.rs holds
         // the contract.

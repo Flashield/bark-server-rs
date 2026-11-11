@@ -27,6 +27,9 @@ pub struct AppState {
     /// (the SSE streams) watch it so graceful shutdown can complete instead
     /// of waiting on connections that would otherwise never end.
     pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// MCP tool servers behind `/mcp` and `/mcp/:device_key` (src/mcp.rs);
+    /// per-instance session tables with the configured idle TTL.
+    pub mcp: crate::mcp::McpRegistry,
 }
 
 /// Future resolving on SIGINT or SIGTERM (upstream's graceful shutdown
@@ -85,12 +88,14 @@ pub async fn run_server(
         .with_context(|| format!("failed to open sqlite store at {:?}", config.data_dir))?;
     let store: Arc<dyn Store> = Arc::new(store);
     let apns = ApnsClient::from_config(&config).context("failed to initialize APNs client")?;
+    let mcp = crate::mcp::McpRegistry::new(config.mcp_session_idle_ttl);
     let state = AppState {
         config: Arc::new(config.clone()),
         events: Arc::new(EventBus::new(store.clone())),
         store,
         apns: Arc::new(apns),
         shutdown: shutdown_rx,
+        mcp,
     };
     let app_service = api::build_app_service(&state);
     let db_label = format!("sqlite({})", config.data_dir.display());

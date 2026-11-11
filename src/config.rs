@@ -130,6 +130,10 @@ pub struct Config {
     /// maximum retained messages per Device for the realtime replay store,
     /// oldest dropped beyond it, 0 disables the cap; default 1000, ADR-0002)
     pub sse_message_cap: u64,
+    /// MCP session idle TTL (additive, hidden; upstream hardcodes
+    /// `mcpSessionIdleTTL` at 10 minutes, see route_mcp.go — the knob exists
+    /// so the expiry behavior is drivable over the test seam)
+    pub mcp_session_idle_ttl: Duration,
 }
 
 impl Default for Config {
@@ -158,6 +162,7 @@ impl Default for Config {
             sse_keepalive_secs: 15,
             sse_message_ttl_secs: 72 * 60 * 60,
             sse_message_cap: 1000,
+            mcp_session_idle_ttl: crate::mcp::SESSION_IDLE_TTL,
         }
     }
 }
@@ -317,6 +322,15 @@ pub struct Cli {
     /// 0 disables the cap)
     #[arg(long, env = "BARK_SERVER_SSE_MESSAGE_CAP", default_value = "1000")]
     pub sse_message_cap: u64,
+    /// Idle TTL after which MCP sessions are closed (additive, hidden;
+    /// upstream hardcodes 10 minutes in route_mcp.go)
+    #[arg(
+        long,
+        env = "BARK_SERVER_MCP_SESSION_IDLE_TTL",
+        default_value = "10m",
+        hide = true
+    )]
+    pub mcp_session_idle_ttl: GoDuration,
 }
 
 /// Every long flag name the CLI defines (plus the auto-generated ones), used
@@ -345,6 +359,7 @@ const LONG_FLAGS: &[&str] = &[
     "sse-keepalive-secs",
     "sse-message-ttl-secs",
     "sse-message-cap",
+    "mcp-session-idle-ttl",
     "help",
     "version",
 ];
@@ -411,6 +426,7 @@ impl Cli {
             sse_keepalive_secs: self.sse_keepalive_secs,
             sse_message_ttl_secs: self.sse_message_ttl_secs,
             sse_message_cap: self.sse_message_cap,
+            mcp_session_idle_ttl: self.mcp_session_idle_ttl.0,
         }
     }
 }
