@@ -210,18 +210,36 @@ async fn exempt_routes_pass_without_credentials() {
 #[tokio::test]
 async fn exemption_is_a_byte_prefix_on_the_raw_path() {
     // Upstream: strings.HasPrefix(c.Path(), prefix) — byte prefix, raw path,
-    // so /pingpong and /ping/2 pass without auth (and then 404 on this
-    // skeleton, which has no compat routes yet), while /PING does not.
+    // so /pingpong and /ping/2 pass without auth and land on the compat push
+    // routes (ticket 04), while /PING does not.
     let server = spawn_auth("/", "u", "p").await;
     let http = client();
 
     let pingpong = http.get(server.url("/pingpong")).send().await.unwrap();
-    assert_eq!(pingpong.status(), 404, "byte-prefix exemption, then 404");
+    assert_eq!(
+        pingpong.status(),
+        400,
+        "byte-prefix exemption, then compat push"
+    );
     let body: serde_json::Value = pingpong.json().await.unwrap();
-    assert_envelope_no_data(&body, 404, "Cannot GET /pingpong");
+    assert_envelope_no_data(
+        &body,
+        400,
+        "failed to get device token: failed to get [pingpong] device token from database",
+    );
 
     let ping2 = http.get(server.url("/ping/2")).send().await.unwrap();
-    assert_eq!(ping2.status(), 404, "byte-prefix exemption, then 404");
+    assert_eq!(
+        ping2.status(),
+        400,
+        "byte-prefix exemption, then compat push"
+    );
+    let body: serde_json::Value = ping2.json().await.unwrap();
+    assert_envelope_no_data(
+        &body,
+        400,
+        "failed to get device token: failed to get [ping] device token from database",
+    );
 
     let pingpong_case = http.get(server.url("/PINGPONG")).send().await.unwrap();
     assert_eq!(
@@ -362,9 +380,17 @@ async fn auth_under_non_root_url_prefix() {
     let register = http.get(server.url("/register")).send().await.unwrap();
     assert_eq!(register.status(), 400, "/bark/register exempt, not 418");
     let healthzz = http.get(server.url("/healthzz")).send().await.unwrap();
-    assert_eq!(healthzz.status(), 404, "joined byte-prefix exemption");
+    assert_eq!(
+        healthzz.status(),
+        400,
+        "joined byte-prefix exemption lands on the compat push"
+    );
     let pingpong = http.get(server.url("/pingpong")).send().await.unwrap();
-    assert_eq!(pingpong.status(), 404, "joined byte-prefix exemption");
+    assert_eq!(
+        pingpong.status(),
+        400,
+        "joined byte-prefix exemption lands on the compat push"
+    );
 
     // Raw-path case sensitivity still applies under the prefix.
     let case = http.get(server.url("/PING")).send().await.unwrap();
