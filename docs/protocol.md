@@ -65,6 +65,20 @@ credentials still proceed on exempt paths. Basic Auth wraps *everything*
 including `/realtime/v1` and `/mcp`: a Realtime Client behind Basic Auth must
 send the `Authorization` header alongside its `X-Stream-Token`.
 
+### 1.5 Storage backend (operator-level)
+
+The storage backend is invisible to this protocol: every behavior in this
+document holds on either backend. The default is fully embedded — SQLite
+(one `bark.db` file under the `--data` directory), zero external services
+(ADR-0005). Setting `--dsn` / `BARK_SERVER_DSN` to a libpq connection string
+(URL `postgres://user:pass@host:port/db` or keyword/value form) selects the
+PostgreSQL backend for shared-infrastructure deployments. This replaces
+upstream's backend deliberately (ADR-0005): upstream activates its MySQL
+backend with `--dsn`; this server uses the same flag for PostgreSQL — there
+is no direct database migration path from an existing upstream instance —
+and upstream's `--mysql-tls-*` flags are dropped (TLS is carried by the
+DSN's own `sslmode=` parameters).
+
 ## 2. Compat API — the upstream bark-server surface
 
 This section is the drop-in compatibility promise (ADR-0003): the official
@@ -325,6 +339,15 @@ Both are dedicated headers on purpose: no `Authorization` scheme parsing, no
 query parameters (tokens in URLs leak into logs and proxies), consistent
 one-header-per-credential shape.
 
+Security property (ADR-0006): the Device Key authorizes pushing **and**
+stream-token minting — it is a shared management secret in the upstream bark
+model, so whoever can push to a Device can also mint themselves a Stream
+Token for it. The split exists so client machines hold only a revocable,
+per-client read credential: the long-lived Device Key never has to be stored
+on them, and a leaked or compromised token can be revoked without rotating
+the Device Key. It is *not* a claim that a push-key holder cannot read
+notification contents — minting is one Device-Key-authenticated call away.
+
 ### 3.1 Register a Stream Device
 
 ```sh
@@ -425,7 +448,7 @@ empty success, per HTTP semantics); every other method answers
 
 Handshake: the **first body bytes are a `: connected` comment**. Once a
 client has read that comment it is guaranteed every push published
-afterwards — the subscription is registered before the comment is written —
+afterwards — the stream is subscribed before the comment is written —
 plus everything retained before it when `Last-Event-ID` was presented (§3.5).
 
 ```sh
@@ -489,8 +512,8 @@ Cursor parsing, pinned:
 
 | `Last-Event-ID` | Behavior |
 |---|---|
-| absent or empty | Fresh subscription — no replay (live events only, from the `: connected` handshake on) |
-| non-numeric (or beyond 64-bit range) | Treated as absent — fresh subscription; failing the connect would break auto-reconnect cycles for no benefit |
+| absent or empty | Fresh stream — no replay (live events only, from the `: connected` handshake on) |
+| non-numeric (or beyond 64-bit range) | Treated as absent — fresh stream; failing the connect would break auto-reconnect cycles for no benefit |
 | numeric, older than every retained id | Replays from the **oldest retained** message (the retention window is the floor, not an error) |
 | numeric, before the newest id | Replays exactly the retained ids > cursor, then goes live |
 | numeric, ≥ newest id (e.g. `999`) | Replays nothing; goes live |

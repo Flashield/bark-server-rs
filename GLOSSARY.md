@@ -21,7 +21,11 @@ The persisted state of a Device: its Device Token (if any), device type, and las
 
 **Push**:
 One notification request: title/subtitle/body plus arbitrary extension parameters, delivered to one Device or fanned out to a batch.
-_Avoid_: message, notification request
+_Avoid_: message for the Push itself (reserved for its retained record, see Message), notification request
+
+**Message**:
+The retained, id-addressed record of a Push in the store-and-forward store; what Realtime Streams replay (ADR-0002). The store layer legitimately names things after it — the `messages` table, `MessageRecord`, the `--sse-message-ttl-secs` / `--sse-message-cap` flags, and `/info`'s `pending_messages`.
+_Avoid_: conflating with the Push (a Message is persisted replay state; a Push is the request that produced it)
 
 **Ext Params**:
 Unrecognized request parameters, passed through verbatim (keys lowercased, values stringified) as custom APNs payload keys.
@@ -38,7 +42,7 @@ A per-Realtime-Client SSE connection bound to one Device, receiving a mirror of 
 _Avoid_: channel, session, subscription
 
 **Stream Token**:
-The read credential a Realtime Client presents to hold a Realtime Stream; issued at stream registration, revocable per client, distinct from the Device Key (which authorizes pushing, not reading).
+The read credential a Realtime Client presents to hold a Realtime Stream; issued at stream registration, revocable per client, distinct from the Device Key (which authorizes pushing and stream-token minting — the shared management secret, ADR-0006).
 _Avoid_: read key
 
 **Stream Device**:

@@ -15,7 +15,7 @@ pub mod shortuuid;
 pub mod store;
 
 pub use config::Config;
-pub use server::{run_server, shutdown_signal};
+pub use server::{run_server, run_server_on_listener, shutdown_signal};
 
 /// Upstream injects these via ldflags (`git describe --tags`, `git
 /// rev-parse HEAD`, build date). Overridable at build time with

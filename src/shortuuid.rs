@@ -37,10 +37,26 @@ pub fn encode(uuid: [u8; 16]) -> String {
 /// A random UUIDv4 (version nibble `4`, RFC 4122 variant bits `10xx`),
 /// sourced from the OS CSPRNG. Hand-rolled to stay dependency-light; mirrors
 /// what the `uuid` crate would produce for `Uuid::new_v4()`.
-fn new_uuid_v4() -> [u8; 16] {
+pub(crate) fn new_uuid_v4() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     crate::random::fill(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     bytes
+}
+
+/// A random UUIDv4 in canonical lowercase hex form (`8-4-4-4-4-12` with
+/// hyphens) — what the `uuid` crate renders for `Uuid::new_v4()`. The MCP
+/// session ids (`mcp-session-<uuid>`) mint theirs here.
+pub fn new_uuid_v4_string() -> String {
+    let bytes = new_uuid_v4();
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
