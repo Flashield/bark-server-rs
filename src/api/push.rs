@@ -179,12 +179,6 @@ async fn push_core(state: &AppState, params: Map<String, Value>) -> Result<(), (
     // blanked (invalid) tokens with "device token invalid" — both wrapped
     // into "failed to get device token: %v" here.
     let record = match state.store.device_record_by_key(&msg.device_key) {
-        Ok(Some(record)) if record.token.is_empty() => {
-            return Err((
-                400,
-                "failed to get device token: device token invalid".to_string(),
-            ));
-        }
         Ok(Some(record)) => record,
         Ok(None) => {
             return Err((
@@ -200,6 +194,28 @@ async fn push_core(state: &AppState, params: Map<String, Value>) -> Result<(), (
 
     msg.device_token = record.token.clone();
     msg.device_type = record.device_type.clone();
+
+    // Ticket 07 (ADR-0002/0006): every push to a resolved Device persists to
+    // the per-device message store and fans out on the event bus BEFORE any
+    // delivery — APNs below and the SSE streams (subscribed on the bus) both
+    // hang off this same pipeline. A store failure answers 500.
+    if let Err(e) = state.events.publish(&msg).await {
+        return Err((500, format!("message store failed: {e}")));
+    }
+
+    // A Stream Device has no Device Token: the realtime stream is its only
+    // delivery path (ADR-0006), so the push succeeds without APNs. An
+    // upstream device type with a blanked token keeps upstream's error —
+    // the stream mirror and store entry above still happened.
+    if record.token.is_empty() {
+        if record.device_type == crate::store::DEVICE_TYPE_STREAM {
+            return Ok(());
+        }
+        return Err((
+            400,
+            "failed to get device token: device token invalid".to_string(),
+        ));
+    }
 
     match state.apns.push(&msg).await {
         apns::ApnsOutcome::Accepted => Ok(()),

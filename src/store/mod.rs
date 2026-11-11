@@ -81,6 +81,33 @@ pub enum RevokeOutcome {
     AlreadyRevoked,
 }
 
+/// A Push to persist, before the store assigns its per-device monotonic id
+/// (the exact payload the spec's `messages` table stores: title, subtitle,
+/// body, Ext Params JSON, Device Key; `created_at` is assigned by the store).
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    pub device_key: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    /// Ext Params serialized as a JSON object (keys lowercased, values
+    /// stringified per the push core's rules; `{}` when empty).
+    pub ext_params: String,
+}
+
+/// A persisted Push: [`NewMessage`] plus the assigned per-device monotonic
+/// id and the server-side creation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRecord {
+    pub device_key: String,
+    pub id: i64,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub ext_params: String,
+    pub created_at: i64,
+}
+
 /// Persistence for Devices (and, in later tickets, Stream Tokens and pending
 /// messages). Sync on purpose: SQLite calls are short and the connection is
 /// mutex-guarded; callers on the async runtime should keep using it for
@@ -89,6 +116,21 @@ pub enum RevokeOutcome {
 pub trait Store: Send + Sync {
     /// Number of registered Devices; backs `/info`'s `devices` field.
     fn count_devices(&self) -> Result<i64, StoreError>;
+
+    /// Number of minted Stream Tokens (all of them, revoked included — the
+    /// `active_streams` stat covers liveness); backs `/info`'s `streams`.
+    fn count_stream_tokens(&self) -> Result<i64, StoreError>;
+
+    /// Number of stored (pending) messages across all Devices; backs
+    /// `/info`'s `pending_messages`.
+    fn count_messages(&self) -> Result<i64, StoreError>;
+
+    /// Persist a Push to the per-device message store (ADR-0002) and return
+    /// the full record. The per-device monotonic id is assigned here — from
+    /// the `device_message_seq` counter, which never regresses even when
+    /// retention pruning (ticket 08) removes rows — and `created_at` is the
+    /// assignment time. Callers persist BEFORE fan-out.
+    fn insert_message(&self, message: &NewMessage) -> Result<MessageRecord, StoreError>;
 
     /// Create or update the Device Record for `key`, mirroring upstream
     /// `SaveDeviceTokenByKey`: when `key` is empty or unknown, a new

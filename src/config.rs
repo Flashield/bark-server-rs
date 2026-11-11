@@ -118,6 +118,10 @@ pub struct Config {
     /// `BARK_SERVER_APNS_INSECURE_SKIP_TLS_VERIFY` (additive; companion to
     /// `--apns-endpoint` so a local self-signed APNs stub can stand in)
     pub apns_insecure_skip_tls_verify: bool,
+    /// `--sse-keepalive-secs` / `BARK_SERVER_SSE_KEEPALIVE_SECS` (additive;
+    /// seconds between SSE keepalive comment lines on the realtime stream,
+    /// keeping proxies/NATs from idling the connection out; 0 disables)
+    pub sse_keepalive_secs: u64,
 }
 
 impl Default for Config {
@@ -143,6 +147,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(10),
             apns_endpoint: "https://api.push.apple.com".into(),
             apns_insecure_skip_tls_verify: false,
+            sse_keepalive_secs: 15,
         }
     }
 }
@@ -283,6 +288,11 @@ pub struct Cli {
         num_args = 0..=1
     )]
     pub apns_insecure_skip_tls_verify: bool,
+
+    /// Seconds between SSE keepalive comments on the realtime stream
+    /// (additive; 0 disables keepalives)
+    #[arg(long, env = "BARK_SERVER_SSE_KEEPALIVE_SECS", default_value = "15")]
+    pub sse_keepalive_secs: u64,
 }
 
 /// Every long flag name the CLI defines (plus the auto-generated ones), used
@@ -308,6 +318,7 @@ const LONG_FLAGS: &[&str] = &[
     "idle-timeout",
     "apns-endpoint",
     "apns-insecure-skip-tls-verify",
+    "sse-keepalive-secs",
     "help",
     "version",
 ];
@@ -371,6 +382,7 @@ impl Cli {
             idle_timeout: self.idle_timeout.0,
             apns_endpoint: self.apns_endpoint.clone(),
             apns_insecure_skip_tls_verify: self.apns_insecure_skip_tls_verify,
+            sse_keepalive_secs: self.sse_keepalive_secs,
         }
     }
 }

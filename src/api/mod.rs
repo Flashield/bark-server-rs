@@ -22,6 +22,7 @@ pub mod misc;
 pub mod push;
 pub mod realtime;
 pub mod register;
+pub mod sse;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -192,9 +193,10 @@ pub fn normalized_prefix(url_prefix: &str) -> String {
 /// static name, so this is exact for all reachable requests.
 const STATIC_SEGMENTS: &[&str] = &[
     "ping", "healthz", "info", "register", "push",
-    // Realtime credential plane (api/realtime.rs); like the upstream route
-    // names, these match case-insensitively under fiber's default config.
-    "realtime", "v1", "devices", "streams",
+    // Realtime credential plane (api/realtime.rs) and the SSE stream
+    // endpoint (api/sse.rs); like the upstream route names, these match
+    // case-insensitively under fiber's default config.
+    "realtime", "v1", "devices", "streams", "stream",
 ];
 
 /// Fiber-compatible path normalization: trim all trailing slashes unless
@@ -373,6 +375,9 @@ pub fn build_app_service(state: &AppState) -> AppService<Router> {
             "/realtime/v1/devices/{device_key}/streams/{token_id}",
             delete_route(realtime::stream_revoke),
         )
+        // The SSE realtime stream: Stream Token auth, live push mirror
+        // (api/sse.rs holds the contract).
+        .route("/realtime/v1/stream", get_route(sse::stream_connect))
         .fallback(not_found)
         .with_state(state.clone());
 
